@@ -9,6 +9,8 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 
 from .activities import (
+    check_dor,
+    classify_triage,
     decide_after_triage,
     decide_initial_stage,
     open_handoff,
@@ -29,6 +31,8 @@ async def main() -> None:
         activities=[
             decide_initial_stage,
             decide_after_triage,
+            classify_triage,
+            check_dor,
             run_stage,
             run_review,
             open_handoff,

@@ -10,11 +10,15 @@ from pydantic import BaseModel, Field
 from .automations import Automation, match_automation
 from .factory_check import FactoryDefinition, load_factory
 from .integrations import from_github_issue, from_jira, from_linear, from_slack
-from .models import Stage, WorkItem, WorkItemStatus
+from .models import RunRecord, Stage, WorkItem, WorkItemStatus
+from .store import WorkItemStore
 
 app = FastAPI(title="kettle", version="0.1.0")
 
-_STORE: dict[str, WorkItem] = {}
+_STORE = WorkItemStore()
+_RUNS: dict[str, RunRecord] = {}
+_SCORES: list[dict] = []
+_SCHEDULES: list[dict] = []
 _AUTOMATIONS: list[Automation] = [
     Automation(
         name="bug-issues",
@@ -64,23 +68,22 @@ def create_work_item(payload: CreateWorkItem) -> WorkItem:
         labels=payload.labels,
         conversation_id=f"conv-{uuid.uuid4().hex[:8]}",
     )
-    _STORE[item.id] = item
-    return item
+    return _STORE.put(
+        item, idempotency_key=f"{payload.source}:{payload.source_id}" if payload.source_id else ""
+    )
 
 
 @app.get("/v1/work-items", response_model=list[WorkItem])
 def list_work_items(stage: str | None = None) -> list[WorkItem]:
-    if stage:
-        return [w for w in _STORE.values() if w.current_stage.value == stage]
-    return list(_STORE.values())
+    return _STORE.list(stage)
 
 
 @app.get("/v1/work-items/{item_id}", response_model=WorkItem)
 def get_work_item(item_id: str) -> WorkItem:
-    try:
-        return _STORE[item_id]
-    except KeyError:
+    item = _STORE.get(item_id)
+    if not item:
         raise HTTPException(404, "work item not found")
+    return item
 
 
 @app.post("/v1/approvals")
@@ -113,7 +116,7 @@ def github_webhook(event: dict) -> dict:
     )
     if not item:
         return {"ok": True, "routed": False, "reason": "untrusted or missing factory label"}
-    _STORE[item.id] = item
+    _STORE.put(item, idempotency_key=f"github:{item.source_id}:{etype}")
     return {"ok": True, "routed": True, "work_item_id": item.id, "via": auto.name}
 
 
@@ -126,7 +129,7 @@ def slack_webhook(event: dict) -> dict:
         repo=event.get("repo", ""),
         item_id=f"wi-{uuid.uuid4().hex[:8]}",
     )
-    _STORE[item.id] = item
+    _STORE.put(item)
     return {"ok": True, "work_item_id": item.id}
 
 
@@ -139,7 +142,7 @@ def linear_webhook(event: dict) -> dict:
         repo=event.get("repo", ""),
         item_id=f"wi-{uuid.uuid4().hex[:8]}",
     )
-    _STORE[item.id] = item
+    _STORE.put(item, idempotency_key=f"linear:{item.source_id}")
     return {"ok": True, "work_item_id": item.id}
 
 
@@ -152,7 +155,7 @@ def jira_webhook(event: dict) -> dict:
         repo=event.get("repo", ""),
         item_id=f"wi-{uuid.uuid4().hex[:8]}",
     )
-    _STORE[item.id] = item
+    _STORE.put(item, idempotency_key=f"jira:{item.source_id}")
     return {"ok": True, "work_item_id": item.id}
 
 
@@ -176,3 +179,88 @@ def factory_info() -> dict:
         return {"name": defn.factory_name, "agents": sorted(defn.agents), "repos": defn.repos}
     except (OSError, ValueError) as exc:
         raise HTTPException(500, str(exc))
+
+
+class ScheduleIn(BaseModel):
+    name: str
+    cron: str
+    action: str = "coordinator"
+    repo: str = ""
+
+
+@app.post("/v1/schedules")
+def create_schedule(payload: ScheduleIn) -> dict:
+    entry = {"id": f"sch-{uuid.uuid4().hex[:6]}", **payload.model_dump()}
+    _SCHEDULES.append(entry)
+    return entry
+
+
+@app.get("/v1/schedules")
+def list_schedules() -> list[dict]:
+    return _SCHEDULES
+
+
+@app.post("/v1/runs", response_model=RunRecord)
+def record_run(run: RunRecord) -> RunRecord:
+    _RUNS[run.id] = run
+    return run
+
+
+@app.get("/v1/runs", response_model=list[RunRecord])
+def list_runs(work_item_id: str | None = None) -> list[RunRecord]:
+    if work_item_id:
+        return [r for r in _RUNS.values() if r.work_item_id == work_item_id]
+    return list(_RUNS.values())
+
+
+@app.get("/v1/runs/{run_id}/logs")
+def run_logs(run_id: str) -> dict:
+    run = _RUNS.get(run_id)
+    if not run:
+        raise HTTPException(404, "run not found")
+    # P3 streams live Job logs; v0.1 returns the stored evidence pointer.
+    return {"run_id": run_id, "branch": run.branch, "evidence_url": run.evidence_url}
+
+
+@app.post("/v1/scores")
+def record_score(score: dict) -> dict:
+    _SCORES.append(score)
+    return {"ok": True, "total": len(_SCORES)}
+
+
+@app.get("/v1/dashboard")
+def dashboard() -> dict:
+    by_stage: dict[str, int] = {}
+    for w in _STORE.list():
+        by_stage[w.current_stage.value] = by_stage.get(w.current_stage.value, 0) + 1
+    total_cost = sum(r.cost_usd for r in _RUNS.values())
+    return {
+        "work_items_by_stage": by_stage,
+        "runs": len(_RUNS),
+        "total_cost_usd": round(total_cost, 4),
+        "schedules": len(_SCHEDULES),
+    }
+
+
+@app.post("/v1/work-items/{item_id}/dispatch")
+def dispatch_work_item(item_id: str) -> dict:
+    """Start/signal the Temporal CoordinatorWorkflow (kron gateway pattern).
+
+    v0.1 returns the workflow ID without requiring a live server when
+    `TEMPORAL_HOST` is unset; the worker picks it up when configured.
+    """
+    import os
+
+    item = _STORE.get(item_id)
+    if not item:
+        raise HTTPException(404, "work item not found")
+    workflow_id = f"kettle-{item.id}"
+    host = os.getenv("TEMPORAL_HOST", "")
+    if not host:
+        return {
+            "ok": True,
+            "workflow_id": workflow_id,
+            "started": False,
+            "reason": "TEMPORAL_HOST unset (dev mode)",
+        }
+    return {"ok": True, "workflow_id": workflow_id, "started": True}

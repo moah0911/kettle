@@ -66,6 +66,16 @@ def check_factory(defn: FactoryDefinition) -> list[str]:
         errors.append("review model vendor must differ from implement model vendor")
     if not defn.repos:
         errors.append("factory.repos is empty")
+    for name, runner in defn.runners.items():
+        resources = runner.resources or {}
+        if not resources.get("cpu") or not resources.get("memory"):
+            errors.append(f"runner {name}: set cpu+memory limits")
+        if resources.get("timeoutMinutes", 30) > 120:
+            errors.append(f"runner {name}: timeoutMinutes must be <= 120")
+    if not defn.scorers:
+        errors.append("no scorers defined (need at least tests-pass)")
+    if not defn.automations:
+        errors.append("no automations defined")
     return errors
 
 

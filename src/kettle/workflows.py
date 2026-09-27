@@ -56,9 +56,25 @@ class CoordinatorWorkflow:
             )
             if self._cancelled:
                 return Stage.CANCELLED.value
+            triage = await workflow.execute_activity(
+                activities.classify_triage,
+                args=[title, body, labels],
+                start_to_close_timeout=timedelta(minutes=1),
+            )
+            dor = await workflow.execute_activity(
+                activities.check_dor,
+                args=[title, body, labels, triage],
+                start_to_close_timeout=timedelta(minutes=1),
+            )
+            if not dor["ready"]:
+                # Park on human: question gate instead of guessing.
+                await workflow.wait_condition(lambda: self._answer is not None or self._cancelled)
+                if self._cancelled:
+                    return Stage.CANCELLED.value
+                body = f"{body}\n\nAnswers: {self._answer}"
             stage = await workflow.execute_activity(
                 activities.decide_after_triage,
-                args=[title, body, labels, "m"],
+                args=[title, body, labels, triage.get("complexity", "m")],
                 start_to_close_timeout=timedelta(minutes=1),
             )
         if stage == Stage.PLANNING.value:

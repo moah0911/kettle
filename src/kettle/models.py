@@ -66,3 +66,27 @@ class RunRecord(BaseModel):
     evidence_url: str = ""
     branch: str = ""
     verdict: ReviewVerdict | None = None
+
+
+class HandoffArtifact(BaseModel):
+    """Long docs (research memos, plans) pass by ID, not inline — eve pattern."""
+
+    id: str = Field(pattern=r"^[a-z0-9-]{1,64}$")
+    kind: str = Field(description="research|plan|diff|review")
+    work_item_id: str
+    body: str = ""
+    size_bytes: int = 0
+
+
+class TriageVerdict(BaseModel):
+    type: str = "bug"  # bug|feature|chore|question|invalid
+    priority: str = "p2"  # p0|p1|p2|p3
+    complexity: str = "m"  # xs|s|m|l|xl
+    area: str = ""
+    actionable: bool = True
+    reason: str = ""
+
+
+class DefinitionOfReady(BaseModel):
+    ready: bool
+    missing: list[str] = Field(default_factory=list)

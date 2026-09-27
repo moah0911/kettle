@@ -37,4 +37,34 @@ spec:
           command: ["python", "-m", "kettle.worker"]
           env:
             - { name: TEMPORAL_HOST, value: "temporal:7233" }
+            - { name: TEMPORAL_TASK_QUEUE, value: "kettle" }
             - { name: RUNNER_BACKEND, value: "kubernetes" }
+            - { name: K8S_NAMESPACE, value: "kettle" }
+---
+# KEDA autoscale workers on Temporal queue depth (kron pattern).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata: { name: kettle-worker, namespace: kettle }
+spec:
+  scaleTargetRef: { name: kettle-worker }
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  triggers:
+    - type: temporal
+      metadata: { taskQueue: "kettle", targetValue: "5" }
+---
+# Scheduled intake (direct runs on a timer).
+apiVersion: batch/v1
+kind: CronJob
+metadata: { name: kettle-schedule, namespace: kettle }
+spec:
+  schedule: "*/30 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: dispatch
+              image: ghcr.io/kettle/kettle:latest
+              command: ["python", "-c", "print('dispatch schedules via /v1/schedules')"]

@@ -10,6 +10,8 @@ from .models import WorkItem
 def submit_task(title: str, body: str, repo: str) -> WorkItem:
     import uuid
 
+    if not repo or "/" not in repo:
+        raise ValueError("repo must be owner/repo or a https URL")
     return WorkItem(
         id=f"wi-{uuid.uuid4().hex[:8]}", source="mcp", title=title, body=body, repo=repo
     )

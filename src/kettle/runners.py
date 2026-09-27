@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 SAFE = re.compile(r"[^a-zA-Z0-9-]+")
+_GH = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(\.git)?$")
 
 
 def slugify(value: str) -> str:
@@ -13,6 +14,25 @@ def slugify(value: str) -> str:
 
 def branch_name(prefix: str, work_item_id: str) -> str:
     return f"{prefix}{slugify(work_item_id)}"
+
+
+def validate_repo_url(url: str) -> str:
+    """Brokered git: only validated literal URLs, never mutable remote config."""
+    if not _GH.match(url) and "/" not in url:
+        raise ValueError(f"bad repo url: {url}")
+    if url.startswith("https://github.com/"):
+        if not _GH.match(url):
+            raise ValueError(f"bad repo url: {url}")
+        return url[:-4] + ".git" if not url.endswith(".git") else url
+    return url  # short form owner/repo allowed for dev
+
+
+def skill_env(skills: list[str], mcp_servers: list[dict] | None = None) -> dict:
+    """Skill injection (kelos/kube-foundry pattern): merged config via env."""
+    return {
+        "SKILL_PROMPTS": ",".join(skills),
+        "SKILL_MCP_SERVERS": ",".join(s.get("name", "") for s in (mcp_servers or [])),
+    }
 
 
 def build_k8s_job(
@@ -28,9 +48,12 @@ def build_k8s_job(
     cpu: str = "2",
     memory: str = "4Gi",
     timeout_minutes: int = 30,
+    skills: list[str] | None = None,
+    mcp_servers: list[dict] | None = None,
 ) -> dict:
     branch = branch_name(branch_prefix, work_item_id)
     job_name = f"kettle-{slugify(work_item_id)}-{slugify(stage)}"
+    extra = skill_env(skills or [], mcp_servers)
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -57,6 +80,8 @@ def build_k8s_job(
                                 {"name": "MODEL", "value": model},
                                 {"name": "REPO", "value": repo},
                                 {"name": "BRANCH", "value": branch},
+                                {"name": "SKILL_PROMPTS", "value": extra["SKILL_PROMPTS"]},
+                                {"name": "SKILL_MCP_SERVERS", "value": extra["SKILL_MCP_SERVERS"]},
                             ],
                             "resources": {
                                 "limits": {"cpu": cpu, "memory": memory},
