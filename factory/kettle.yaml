@@ -1,0 +1,66 @@
+# Factory definition — version-controlled, reviewed via PR like app code.
+factory:
+  name: default
+  repos:
+    - "acme/app"
+
+agents:
+  coordinator:
+    model: "anthropic/claude-sonnet-4-6"
+    harness: "shell"
+    instructions: "Route each work item through the shortest path that meets quality policy. Never merge. Ask instead of guessing."
+  triage:
+    model: "anthropic/claude-haiku-4-5"
+    harness: "shell"
+    instructions: "Research codebase + related issues. Reproduce only when research cannot establish cause. Output scope, complexity, open questions."
+  spec:
+    model: "anthropic/claude-sonnet-4-6"
+    harness: "shell"
+    instructions: "Write product + technical spec with validation criteria in a draft PR. Block building until human approves."
+  implement:
+    model: "anthropic/claude-sonnet-4-6"
+    harness: "claude-code"
+    instructions: "Continue spec branch. Add tests, run repo validation, capture evidence. Never merge."
+  review:
+    model: "openai/gpt-5-codex"
+    harness: "codex"
+    instructions: "Independently judge pushed branch against acceptance criteria with evidence. Approve, request-changes (max 2 cycles), or reject. Advisory only."
+    vendor_must_differ_from: "implement"
+
+automations:
+  - name: "bug-issues"
+    on: "github.issue_labeled"
+    if: "label == 'factory' and permission >= 'triage'"
+    do: "coordinator"
+  - name: "mention"
+    on: "github.comment"
+    if: "mentions contains 'foreman' and role in ['OWNER','MEMBER','COLLABORATOR']"
+    do: "coordinator"
+  - name: "ci-fix"
+    on: "github.check_suite.failed"
+    if: "branch startswith 'factory/'"
+    do: "coordinator"
+
+runners:
+  default:
+    backend: "kubernetes"  # or docker for dev
+    image: "ghcr.io/kettle/agent-runner:latest"
+    resources: { cpu: "2", memory: "4Gi", timeoutMinutes: 30 }
+    branch_prefix: "factory/"
+
+scorers:
+  - name: "tests-pass"
+    criteria: "repo test command exits 0 on the pushed branch"
+  - name: "criteria-met"
+    criteria: "every acceptance criterion judged with file:line evidence"
+
+webhooks:
+  - path: "/webhooks/github"
+  - path: "/webhooks/linear"
+  - path: "/webhooks/jira"
+  - path: "/webhooks/slack"
+  - path: "/webhooks/custom"
+
+skills:
+  - "writing-quality"
+  - "triaging-issues"
