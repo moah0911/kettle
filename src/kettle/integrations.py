@@ -10,18 +10,16 @@ from .models import WorkItem
 from .trust import TRUSTED_ROLES
 
 
-def _dev_bypass_allowed() -> bool:
-    return os.getenv("ALLOW_UNVERIFIED_DEV", "1") == "1"
+def _require_secret(name: str) -> str:
+    secret = os.getenv(name, "")
+    if not secret:
+        raise RuntimeError(f"{name} is required (no dev bypass)")
+    return secret
 
 
 def verify_github_signature(payload: bytes, signature: str) -> bool:
-    """HMAC-SHA256 webhook verification. Fail-closed in prod.
-
-    Returns True without a secret only when ALLOW_UNVERIFIED_DEV=1 (dev/test).
-    """
-    secret = os.getenv("GITHUB_WEBHOOK_SECRET", "")
-    if not secret:
-        return _dev_bypass_allowed()
+    """HMAC-SHA256 webhook verification. Fail-closed: secret always required."""
+    secret = _require_secret("GITHUB_WEBHOOK_SECRET")
     if not signature:
         return False
     expected = "sha256=" + hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
@@ -29,9 +27,7 @@ def verify_github_signature(payload: bytes, signature: str) -> bool:
 
 
 def verify_slack_signature(payload: bytes, timestamp: str, signature: str) -> bool:
-    secret = os.getenv("SLACK_SIGNING_SECRET", "")
-    if not secret:
-        return _dev_bypass_allowed()
+    secret = _require_secret("SLACK_SIGNING_SECRET")
     if not timestamp or not signature:
         return False
     try:
@@ -46,10 +42,8 @@ def verify_slack_signature(payload: bytes, timestamp: str, signature: str) -> bo
 
 
 def verify_generic_webhook(secret_env: str, payload: bytes, signature: str) -> bool:
-    """Shared-secret check for Linear/Jira/custom webhooks."""
-    secret = os.getenv(secret_env, "")
-    if not secret:
-        return _dev_bypass_allowed()
+    """Shared-secret check for Linear/Jira/custom webhooks. Fail-closed."""
+    secret = _require_secret(secret_env)
     if not signature:
         return False
     expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
@@ -58,7 +52,7 @@ def verify_generic_webhook(secret_env: str, payload: bytes, signature: str) -> b
 
 def repo_allowed(repo: str, allowed: list[str]) -> bool:
     if not allowed:
-        return True
+        return False
     return repo in allowed
 
 

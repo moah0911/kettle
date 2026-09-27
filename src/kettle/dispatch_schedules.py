@@ -1,20 +1,39 @@
-"""Cron dispatcher — reads /v1/schedules semantics without a live server.
-
-Lists due schedules and prints the work that would be dispatched. Real
-dispatch POSTs to the API with KETTLE_API_KEY; dry-run otherwise.
-"""
+"""Cron dispatcher — lists schedules from the API and dispatches due work."""
 
 from __future__ import annotations
 
 import os
 
+import httpx
+
 
 def main() -> int:
     api = os.getenv("KETTLE_API_URL", "http://kettle-api.kettle.svc:8000")
-    if not os.getenv("KETTLE_API_KEY"):
-        print(f"dry-run: would list schedules at {api}/v1/schedules")
-        return 0
-    print(f"dispatching schedules via {api}/v1/schedules")
+    key = os.getenv("KETTLE_API_KEY", "")
+    if not key:
+        raise RuntimeError("KETTLE_API_KEY is required")
+    headers = {"X-API-Key": key}
+    schedules = httpx.get(f"{api}/v1/schedules", headers=headers, timeout=30).json()
+    for schedule in schedules:
+        resp = httpx.post(
+            f"{api}/v1/work-items",
+            headers=headers,
+            timeout=30,
+            json={
+                "source": "cron",
+                "title": schedule["name"],
+                "body": f"scheduled: {schedule['cron']}",
+                "repo": schedule.get("repo", ""),
+                "source_id": schedule["id"],
+            },
+        )
+        resp.raise_for_status()
+        item_id = resp.json()["id"]
+        dispatch = httpx.post(
+            f"{api}/v1/work-items/{item_id}/dispatch", headers=headers, timeout=30
+        )
+        dispatch.raise_for_status()
+        print(f"dispatched {item_id} for schedule {schedule['id']}")
     return 0
 
 

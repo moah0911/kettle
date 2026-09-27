@@ -1,17 +1,26 @@
-"""Temporal activities — side effects only (LLM, K8s/Docker, git, provider APIs)."""
+"""Temporal activities — side effects only (LLM, K8s, git, provider APIs). All live."""
 
 from __future__ import annotations
 
+import json
 import os
 
 from temporalio import activity
 
 from .artifacts import save_artifact
-from .coordinator import classify, initial_stage, route_after_triage, select_harness
+from .coordinator import initial_stage, route_after_triage, select_harness
 from .harnesses import get_harness
-from .models import HandoffArtifact, RunRecord, Stage, WorkItem
-from .providers import ChatRequest, chat, estimate_cost_usd, is_live, model_for
-from .runners import apply_job, branch_name, build_docker_run, build_k8s_job, validate_repo_url
+from .models import HandoffArtifact, RunRecord, Stage, TriageVerdict, WorkItem
+from .providers import ChatRequest, chat, estimate_cost_usd, model_for
+from .runners import (
+    apply_job,
+    branch_name,
+    build_k8s_job,
+    delete_job,
+    stream_job_logs,
+    validate_repo_url,
+    wait_for_job,
+)
 
 
 @activity.defn
@@ -30,71 +39,68 @@ async def decide_after_triage(title: str, body: str, labels: list[str], complexi
     return route_after_triage(item, complexity).value
 
 
+def _factory_runner_config() -> tuple[str, str, str, int]:
+    from .factory_check import load_factory
+
+    defn = load_factory(os.getenv("FACTORY_DIR", "./factory"))
+    runner = (defn.runners or {}).get("default")
+    if runner is None:
+        raise RuntimeError("factory has no default runner")
+    resources = runner.resources or {}
+    return (
+        runner.image,
+        str(resources["cpu"]),
+        str(resources["memory"]),
+        int(resources["timeoutMinutes"]),
+    )
+
+
 @activity.defn
 async def run_stage(work_item_id: str, stage: str, repo: str) -> str:
-    """Launch execution backend for a stage; returns branch name.
-
-    Dry-run unless KETTLE_LIVE_K8S=1 (real Job apply) and KETTLE_LIVE_HARNESS=1
-    (real CLI harness). Spec-build stays the unit-tested seam.
-    """
+    """Apply a K8s Job, wait for completion, stream logs, run the harness. Returns branch."""
     import re
 
-    backend = os.getenv("RUNNER_BACKEND", "docker")
+    validate_repo_url(repo)
+    namespace = os.getenv("K8S_NAMESPACE", "kettle")
     model = model_for(stage)
-    harness_name = select_harness(stage, model_for("implement"), model_for("review"))
-    harness = get_harness(harness_name)
-    try:
-        validate_repo_url(repo)
-    except ValueError:
-        if os.getenv("ALLOW_STRICT_GIT", "0") == "1":
-            raise
-        activity.logger.warn(f"repo failed brokered-git validation in dev mode: {repo!r}")
+    harness = get_harness(select_harness(stage, model_for("implement"), model_for("review")))
     image, cpu, memory, timeout = _factory_runner_config()
-    launch: dict = {"applied": False, "dry_run": True}
-    if backend == "kubernetes":
-        spec = build_k8s_job(
-            namespace=os.getenv("K8S_NAMESPACE", "kettle"),
-            work_item_id=work_item_id,
-            stage=stage,
-            agent=stage,
-            model=model,
-            repo=repo,
-            image=image,
-            cpu=cpu,
-            memory=memory,
-            timeout_minutes=timeout,
-        )
-        launch = apply_job(spec)
-        activity.logger.info(
-            f"K8s Job {spec['metadata']['name']} dry_run={launch['dry_run']} for {work_item_id}/{stage}"
-        )
-    else:
-        run = build_docker_run(
-            work_item_id=work_item_id,
-            stage=stage,
-            agent=stage,
-            model=model,
-            repo=repo,
-            cpu=cpu,
-            memory=memory,
-            timeout_minutes=timeout,
-        )
-        activity.logger.info(f"Docker run {run['env']['BRANCH']} for {work_item_id}/{stage}")
+    spec = build_k8s_job(
+        namespace=namespace,
+        work_item_id=work_item_id,
+        stage=stage,
+        agent=stage,
+        model=model,
+        repo=repo,
+        image=image,
+        cpu=cpu,
+        memory=memory,
+        timeout_minutes=timeout,
+    )
+    job_name = spec["metadata"]["name"]
+    apply_job(spec)
+    try:
+        status = wait_for_job(namespace=namespace, name=job_name, timeout_s=timeout * 60)
+        logs = stream_job_logs(namespace=namespace, job_name=job_name)
+    finally:
+        delete_job(namespace=namespace, name=job_name)
+    if status.get("failed"):
+        raise RuntimeError(f"stage job {job_name} failed")
     branch = branch_name("factory/", work_item_id)
-    prompt = chat(
+    agent_output = chat(
         ChatRequest(
             model=model,
             system=f"You are the {stage} agent.",
-            user=f"Work item {work_item_id} in {repo}: run stage {stage}.",
+            user=f"Work item {work_item_id} in {repo}: run stage {stage}.\nJob logs:\n{logs[:4000]}",
         )
     )
     result = harness.run(
-        work_item_id=work_item_id, stage=stage, repo=repo, branch=branch, prompt=prompt
+        work_item_id=work_item_id, stage=stage, repo=repo, branch=branch, prompt=agent_output
     )
-    cost = estimate_cost_usd(model, len(prompt.split()))
-    activity.logger.info(
-        f"{result.evidence[:120]} cost~${cost:.4f} dry_run={result.dry_run} launched={launch}"
-    )
+    if result.tests_exit_code != 0:
+        raise RuntimeError(f"harness {harness.name} failed: {result.evidence[:500]}")
+    cost = estimate_cost_usd(model, len(agent_output.split()))
+    activity.logger.info(f"{result.evidence[:120]} cost~${cost:.4f} job={job_name}")
     if stage in {"triage", "spec"}:
         safe_id = re.sub(r"[^a-z0-9-]", "-", work_item_id.lower())[:48] or "task"
         save_artifact(
@@ -102,41 +108,15 @@ async def run_stage(work_item_id: str, stage: str, repo: str) -> str:
                 id=f"{safe_id}-{stage}",
                 kind="research" if stage == "triage" else "plan",
                 work_item_id=work_item_id,
-                body=prompt[:5000],
+                body=agent_output[:5000],
             )
         )
     return branch
 
 
-def _factory_runner_config() -> tuple[str, str, str, int]:
-    """Read factory runner resources; fall back to safe defaults."""
-    try:
-        from .factory_check import load_factory
-
-        defn = load_factory(os.getenv("FACTORY_DIR", "./factory"))
-        runner = (defn.runners or {}).get("default")
-        if runner is None:
-            raise KeyError("no default runner")
-        resources = runner.resources or {}
-        return (
-            runner.image,
-            str(resources.get("cpu", "2")),
-            str(resources.get("memory", "4Gi")),
-            int(resources.get("timeoutMinutes", 30)),
-        )
-    except Exception:  # noqa: BLE001 — dev fallback
-        return ("ghcr.io/kettle/agent-runner:latest", "2", "4Gi", 30)
-
-
 @activity.defn
 async def run_review(work_item_id: str, repo: str) -> str:
-    """Independent review on the exact pushed SHA with a different vendor model.
-
-    Parses the reviewer LLM *output* (not the request) for an explicit verdict.
-    In stub mode (no live LLM) returns approve so dev/tests stay deterministic;
-    live mode requires approve|request_changes|reject plus file:line evidence,
-    else requests changes.
-    """
+    """Independent review: reviewer LLM must return a verdict plus file:line evidence."""
     import re
 
     model = model_for("review")
@@ -151,8 +131,6 @@ async def run_review(work_item_id: str, repo: str) -> str:
         )
     )
     activity.logger.info(output[:120])
-    if not is_live():
-        return "approve"
     text = output.lower()
     has_evidence = bool(re.search(r"[\w/.-]+:\d+", output))
     if "request_changes" in text or "request-changes" in text:
@@ -166,16 +144,24 @@ async def run_review(work_item_id: str, repo: str) -> str:
 
 @activity.defn
 async def classify_triage(title: str, body: str, labels: list[str]) -> dict:
-    item = WorkItem(
-        id="tmp", source="api", title=title or "untitled", body=body, repo="tmp", labels=labels
+    """LLM-backed triage verdict (JSON). No heuristic fallback."""
+    output = chat(
+        ChatRequest(
+            model=model_for("triage"),
+            system=(
+                "You are the triage classifier. Reply ONLY with JSON: "
+                '{"type":"bug|feature|chore|question|invalid","priority":"p0|p1|p2|p3",'
+                '"complexity":"xs|s|m|l|xl","area":"","actionable":true,"reason":"..."}'
+            ),
+            user=f"Title: {title}\nBody: {body}\nLabels: {labels}",
+        )
     )
-    return classify(item).model_dump()
+    return TriageVerdict(**json.loads(output)).model_dump()
 
 
 @activity.defn
 async def check_dor(title: str, body: str, labels: list[str], triage: dict) -> dict:
     from .coordinator import check_definition_of_ready
-    from .models import TriageVerdict
 
     item = WorkItem(
         id="tmp", source="api", title=title or "untitled", body=body, repo="tmp", labels=labels
@@ -185,28 +171,50 @@ async def check_dor(title: str, body: str, labels: list[str], triage: dict) -> d
 
 @activity.defn
 async def open_handoff(work_item_id: str, repo: str) -> str:
+    """Open a draft PR via the GitHub API. Requires GITHUB_TOKEN. Never merges."""
+    import httpx
+
     from .trust import allowed_tool
 
-    # Delivery gate: draft PRs allowed for both attended and unattended;
-    # merge is absent everywhere (enforced here defensively).
     assert allowed_tool("open_draft_pr", trusted=True, unattended=False)
     assert allowed_tool("open_draft_pr", trusted=False, unattended=True)
     assert not allowed_tool("merge", trusted=True, unattended=False)
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        raise RuntimeError("GITHUB_TOKEN is required to open the handoff PR")
     branch = branch_name("factory/", work_item_id)
-    if os.getenv("GITHUB_TOKEN"):
-        activity.logger.info(f"Handoff: draft PR {repo}:{branch} opened for human review.")
-    else:
-        activity.logger.info(
-            f"Handoff dry-run (no GITHUB_TOKEN): would open draft PR {repo}:{branch}."
+    owner_repo = repo if "/" in repo and "://" not in repo else None
+    if owner_repo is None:
+        raise RuntimeError(f"repo must be owner/repo for PR creation: {repo!r}")
+    base = _factory_base_branch()
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"https://api.github.com/repos/{owner_repo}/pulls",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            json={
+                "title": f"Factory: {work_item_id}",
+                "head": branch,
+                "base": base,
+                "draft": True,
+                "body": f"Automated factory handoff for {work_item_id}. Human review required.",
+            },
         )
+        resp.raise_for_status()
     return branch
+
+
+def _factory_base_branch() -> str:
+    return os.getenv("FACTORY_BASE_BRANCH", "main")
 
 
 @activity.defn
 async def record_run_result(run: dict) -> dict:
-    """Persist a stage RunRecord payload (API stores it via POST /v1/runs)."""
+    """Validate and return a stage RunRecord payload for POST /v1/runs."""
     record = RunRecord(
-        id=run.get("id", f"run-{work_item_id_short(run.get('work_item_id', ''))}"),
+        id=run.get("id", f"run-{run.get('work_item_id', '')}"),
         work_item_id=run.get("work_item_id", ""),
         stage=Stage(run.get("stage", "building")),
         agent=run.get("agent", run.get("stage", "implement")),
@@ -219,15 +227,9 @@ async def record_run_result(run: dict) -> dict:
     return record.model_dump()
 
 
-def work_item_id_short(work_item_id: str) -> str:
-    import uuid
-
-    return work_item_id or uuid.uuid4().hex[:8]
-
-
 @activity.defn
-async def score_run(test_exit_code: int, met: int, total: int) -> dict:
+async def score_run(test_exit_code: int, met: int, total: int, evidence_refs: int = 0) -> dict:
     from .scorers import group_failures, score_criteria_met, score_tests_pass
 
-    scores = [score_tests_pass(test_exit_code), score_criteria_met(met, total)]
+    scores = [score_tests_pass(test_exit_code), score_criteria_met(met, total, evidence_refs)]
     return {"scores": [s.model_dump() for s in scores], "group": group_failures(scores)}

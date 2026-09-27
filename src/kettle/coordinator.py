@@ -12,43 +12,6 @@ MAX_REVISION_CYCLES = 2
 TRIVIAL_LABELS = {"trivial", "docs", "chore", "small"}
 
 
-def classify(item: WorkItem) -> TriageVerdict:
-    """Ported classifier station: fast, deterministic triage verdict.
-
-    Real LLM classifier lands in activities; this pure version keeps
-    workflows deterministic and testable.
-    """
-    labels = {label.lower() for label in item.labels}
-    body = (item.body or "").lower()
-    if not item.title and not body:
-        return TriageVerdict(
-            type="invalid", priority="p3", complexity="xs", actionable=False, reason="empty request"
-        )
-    if any(w in body for w in ("?", "how do i", "how to")) and len(body) < 200:
-        return TriageVerdict(
-            type="question",
-            priority="p3",
-            complexity="xs",
-            actionable=False,
-            reason="question, needs answer",
-        )
-    complexity = "m"
-    if labels & TRIVIAL_LABELS or len(body) < 200:
-        complexity = "s"
-    if len(body) > 2000 or "migration" in body or "refactor" in body:
-        complexity = "l"
-    itype = "bug" if ("bug" in labels or "error" in body or "traceback" in body) else "feature"
-    if labels & TRIVIAL_LABELS:
-        itype = "chore"
-    return TriageVerdict(
-        type=itype,  # type: ignore[arg-type]
-        priority="p2",
-        complexity=complexity,  # type: ignore[arg-type]
-        actionable=True,
-        reason="heuristic classification",
-    )
-
-
 def check_definition_of_ready(item: WorkItem, verdict: TriageVerdict) -> DefinitionOfReady:
     """DoR gate (ai-sdlc pattern): no dispatch until acceptance + scope + questions resolve."""
     missing: list[str] = []

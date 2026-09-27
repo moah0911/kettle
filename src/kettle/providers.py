@@ -14,20 +14,16 @@ class ChatRequest:
     max_tokens: int = 2000
 
 
-def is_live() -> bool:
-    return os.getenv("KETTLE_LIVE_LLM") == "1"
-
-
 def chat(req: ChatRequest, *, timeout_s: int = 60, num_retries: int = 3) -> str:
-    """Route via LiteLLM when KETTLE_LIVE_LLM=1, else explicit deterministic stub.
+    """Always call the configured LLM via LiteLLM — no stub path.
 
-    Live path forwards timeout/retries and maps provider errors to RuntimeError
-    with model context. Stub path is marked [stub:...] so callers never mistake
-    it for a real verdict.
+    Requires provider keys for the requested model (e.g. ANTHROPIC_API_KEY,
+    OPENAI_API_KEY). Retries transient failures with backoff, then raises
+    RuntimeError with model context.
     """
-    if not is_live():
-        return f"[stub:{req.model}] {req.user[:200]}"
-    import litellm  # lazy so tests don't require keys
+    import time
+
+    import litellm  # lazy so import-time stays light
 
     last: Exception | None = None
     for attempt in range(max(num_retries, 1)):
@@ -47,6 +43,7 @@ def chat(req: ChatRequest, *, timeout_s: int = 60, num_retries: int = 3) -> str:
             return content
         except Exception as exc:  # noqa: BLE001 — mapped below with context
             last = exc
+            time.sleep(min(2**attempt, 8))
     raise RuntimeError(f"LLM call failed for {req.model} after {num_retries} tries: {last}")
 
 

@@ -1,8 +1,14 @@
-"""Reuse-seam tests: classifier/DoR, trust, artifacts, harnesses, store, runners, scorers."""
+"""Reuse-seam tests: DoR, trust, artifacts, harnesses, store, runners, scorers."""
+
+import hashlib
+import hmac
+import os
+
+import pytest
 
 from kettle.artifacts import clear as clear_artifacts
 from kettle.artifacts import read_artifact, save_artifact, valid_id
-from kettle.coordinator import check_definition_of_ready, classify, select_harness
+from kettle.coordinator import check_definition_of_ready, select_harness
 from kettle.harnesses import get_harness
 from kettle.integrations import verify_github_signature
 from kettle.models import HandoffArtifact, TriageVerdict, WorkItem
@@ -31,9 +37,7 @@ def _item(**kw) -> WorkItem:
     return WorkItem(**base)
 
 
-def test_classify_and_dor():
-    v = classify(_item(body="?", labels=[]))
-    assert v.actionable is False
+def test_dor_gate():
     dor = check_definition_of_ready(
         _item(body="short"), TriageVerdict(actionable=True, complexity="m")
     )
@@ -42,6 +46,22 @@ def test_classify_and_dor():
         _item(body="acceptance: ... " + "x" * 300), TriageVerdict(actionable=True, complexity="s")
     )
     assert ok.ready is True
+
+
+def test_llm_triage_activity(monkeypatch):
+    import asyncio
+
+    import kettle.activities as acts
+
+    def fake_chat(req, **kw):
+        return (
+            '{"type":"bug","priority":"p1","complexity":"m","area":"auth",'
+            '"actionable":true,"reason":"fake"}'
+        )
+
+    monkeypatch.setattr(acts, "chat", fake_chat)
+    out = asyncio.run(acts.classify_triage("Crash", "stack trace " + "x" * 200, ["bug"]))
+    assert out["type"] == "bug" and out["actionable"] is True
 
 
 def test_select_harness_differs():
@@ -74,13 +94,25 @@ def test_artifacts_by_id():
     assert read_artifact("bad/id") is None
 
 
-def test_harness_registry():
+def test_harness_registry(monkeypatch):
+    import kettle.harnesses as h
+
+    def fake_run(cmd, **kw):
+        class P:
+            returncode = 0
+            stdout = "ok"
+            stderr = ""
+
+        return P()
+
+    monkeypatch.setattr(h.subprocess, "run", fake_run)
     assert get_harness("codex").name == "codex"
-    assert get_harness("nope").name == "shell"
+    with pytest.raises(ValueError):
+        get_harness("nope")
     res = get_harness("shell").run(
-        work_item_id="a", stage="building", repo="r", branch="b", prompt="p"
+        work_item_id="a", stage="building", repo="r", branch="b", prompt="echo hi"
     )
-    assert res.branch == "b"
+    assert res.branch == "b" and res.tests_exit_code == 0
 
 
 def test_store_idempotency():
@@ -130,5 +162,16 @@ def test_providers_models():
     assert estimate_cost_usd("anthropic/claude-haiku-4-5", 1000) > 0
 
 
-def test_webhook_verify_open_mode():
-    assert verify_github_signature(b"{}", "") is True
+def test_webhook_verify_fail_closed():
+    # Without secret, verification raises; with secret, bad sig is False.
+    old = os.environ.pop("GITHUB_WEBHOOK_SECRET", None)
+    try:
+        with pytest.raises(RuntimeError):
+            verify_github_signature(b"{}", "")
+    finally:
+        if old is not None:
+            os.environ["GITHUB_WEBHOOK_SECRET"] = old
+    secret = os.environ["GITHUB_WEBHOOK_SECRET"].encode()
+    good = "sha256=" + hmac.new(secret, b"{}", hashlib.sha256).hexdigest()
+    assert verify_github_signature(b"{}", good) is True
+    assert verify_github_signature(b"{}", "sha256=bad") is False

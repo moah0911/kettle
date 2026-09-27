@@ -45,26 +45,67 @@ def skill_env(skills: list[str], mcp_servers: list[dict] | None = None) -> dict:
 
 
 def apply_job(spec: dict) -> dict:
-    """Apply a Job spec, or return explicit dry-run when no cluster is configured.
+    """Create a namespaced Job and return its name. Always contacts the cluster."""
+    from kubernetes import client, config  # type: ignore
 
-    Real apply happens only when KETTLE_LIVE_K8S=1 and the `kubernetes` client
-    is importable; otherwise returns {"applied": False, "dry_run": True}.
-    """
-    import os
-
-    if os.getenv("KETTLE_LIVE_K8S") != "1":
-        return {"applied": False, "dry_run": True, "job": spec["metadata"]["name"]}
-    try:
-        from kubernetes import client, config  # type: ignore
-    except ImportError as exc:
-        raise RuntimeError("kubernetes client not installed") from exc
     try:
         config.load_incluster_config()
     except Exception:  # noqa: BLE001 — fall back to kubeconfig
         config.load_kube_config()
     batch = client.BatchV1Api()
     created = batch.create_namespaced_job(namespace=spec["metadata"]["namespace"], body=spec)
-    return {"applied": True, "dry_run": False, "job": created.metadata.name}
+    return {"applied": True, "job": created.metadata.name}
+
+
+def wait_for_job(*, namespace: str, name: str, timeout_s: int = 1800) -> dict:
+    """Block until the Job completes; return completion status."""
+    import time
+
+    from kubernetes import client, config  # type: ignore
+
+    try:
+        config.load_incluster_config()
+    except Exception:  # noqa: BLE001 — fall back to kubeconfig
+        config.load_kube_config()
+    batch = client.BatchV1Api()
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        job = batch.read_namespaced_job(name=name, namespace=namespace)
+        if job.status.succeeded:
+            return {"succeeded": True, "failed": False}
+        if job.status.failed:
+            return {"succeeded": False, "failed": True}
+        time.sleep(5)
+    raise TimeoutError(f"timed out waiting for job {namespace}/{name}")
+
+
+def stream_job_logs(*, namespace: str, job_name: str, tail_lines: int = 500) -> str:
+    """Fetch logs from the Job's first pod."""
+    from kubernetes import client, config  # type: ignore
+
+    try:
+        config.load_incluster_config()
+    except Exception:  # noqa: BLE001 — fall back to kubeconfig
+        config.load_kube_config()
+    core = client.CoreV1Api()
+    pods = core.list_namespaced_pod(namespace=namespace, label_selector=f"job-name={job_name}")
+    if not pods.items:
+        raise RuntimeError(f"no pods for job {job_name}")
+    return core.read_namespaced_pod_log(
+        name=pods.items[0].metadata.name, namespace=namespace, tail_lines=tail_lines
+    )
+
+
+def delete_job(*, namespace: str, name: str) -> None:
+    from kubernetes import client, config  # type: ignore
+
+    try:
+        config.load_incluster_config()
+    except Exception:  # noqa: BLE001 — fall back to kubeconfig
+        config.load_kube_config()
+    client.BatchV1Api().delete_namespaced_job(
+        name=name, namespace=namespace, propagation_policy="Background"
+    )
 
 
 def build_k8s_job(
