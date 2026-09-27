@@ -2,11 +2,13 @@ services:
   postgres:
     image: postgres:16
     environment:
+      # Dev defaults only — override via .env file in real deployments.
       POSTGRES_USER: kettle
-      POSTGRES_PASSWORD: kettle
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kettle}
       POSTGRES_DB: kettle
-    ports: ["5432:5432"]
     volumes: [postgres-data:/var/lib/postgresql/data]
+    restart: unless-stopped
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U kettle"], interval: 10s, retries: 5 }
 
   temporal:
     image: temporalio/auto-setup:1.25
@@ -15,27 +17,32 @@ services:
       DB: postgresql
       DB_PORT: "5432"
       POSTGRES_USER: kettle
-      POSTGRES_PWD: kettle
+      POSTGRES_PWD: ${POSTGRES_PASSWORD:-kettle}
       POSTGRES_SEEDS: postgres
-    depends_on: [postgres]
+    depends_on: { postgres: { condition: service_healthy } }
+    restart: unless-stopped
 
   api:
     build: .
     command: uvicorn kettle.api:app --host 0.0.0.0 --port 8000
     ports: ["8000:8000"]
     environment:
-      DATABASE_URL: postgresql+asyncpg://kettle:kettle@postgres/kettle
+      DATABASE_URL: postgresql+asyncpg://kettle:${POSTGRES_PASSWORD:-kettle}@postgres/kettle
       TEMPORAL_HOST: temporal:7233
-    depends_on: [postgres, temporal]
+    depends_on: { postgres: { condition: service_healthy }, temporal: { condition: service_started } }
+    restart: unless-stopped
 
   worker:
     build: .
     command: python -m kettle.worker
     environment:
-      DATABASE_URL: postgresql+asyncpg://kettle:kettle@postgres/kettle
+      DATABASE_URL: postgresql+asyncpg://kettle:${POSTGRES_PASSWORD:-kettle}@postgres/kettle
       TEMPORAL_HOST: temporal:7233
       RUNNER_BACKEND: docker
-    depends_on: [postgres, temporal]
+    depends_on: { postgres: { condition: service_healthy }, temporal: { condition: service_started } }
+    restart: unless-stopped
+    # Mounting the docker socket is dev-only (gives host-root equivalent).
+    # Production uses RUNNER_BACKEND=kubernetes with RBAC instead.
     volumes: [/var/run/docker.sock:/var/run/docker.sock]
 
 volumes:

@@ -9,9 +9,9 @@ from temporalio import activity
 from .artifacts import save_artifact
 from .coordinator import classify, initial_stage, route_after_triage, select_harness
 from .harnesses import get_harness
-from .models import HandoffArtifact, WorkItem
-from .providers import ChatRequest, chat, estimate_cost_usd, model_for
-from .runners import branch_name, build_docker_run, build_k8s_job, validate_repo_url
+from .models import HandoffArtifact, RunRecord, Stage, WorkItem
+from .providers import ChatRequest, chat, estimate_cost_usd, is_live, model_for
+from .runners import apply_job, branch_name, build_docker_run, build_k8s_job, validate_repo_url
 
 
 @activity.defn
@@ -32,7 +32,11 @@ async def decide_after_triage(title: str, body: str, labels: list[str], complexi
 
 @activity.defn
 async def run_stage(work_item_id: str, stage: str, repo: str) -> str:
-    """Launch execution backend for a stage; returns branch name."""
+    """Launch execution backend for a stage; returns branch name.
+
+    Dry-run unless KETTLE_LIVE_K8S=1 (real Job apply) and KETTLE_LIVE_HARNESS=1
+    (real CLI harness). Spec-build stays the unit-tested seam.
+    """
     import re
 
     backend = os.getenv("RUNNER_BACKEND", "docker")
@@ -45,6 +49,8 @@ async def run_stage(work_item_id: str, stage: str, repo: str) -> str:
         if os.getenv("ALLOW_STRICT_GIT", "0") == "1":
             raise
         activity.logger.warn(f"repo failed brokered-git validation in dev mode: {repo!r}")
+    image, cpu, memory, timeout = _factory_runner_config()
+    launch: dict = {"applied": False, "dry_run": True}
     if backend == "kubernetes":
         spec = build_k8s_job(
             namespace=os.getenv("K8S_NAMESPACE", "kettle"),
@@ -53,12 +59,25 @@ async def run_stage(work_item_id: str, stage: str, repo: str) -> str:
             agent=stage,
             model=model,
             repo=repo,
+            image=image,
+            cpu=cpu,
+            memory=memory,
+            timeout_minutes=timeout,
         )
-        activity.logger.info(f"K8s Job {spec['metadata']['name']} for {work_item_id}/{stage}")
-        # P3 applies via kubernetes client + streams logs; spec-build is the unit-tested seam.
+        launch = apply_job(spec)
+        activity.logger.info(
+            f"K8s Job {spec['metadata']['name']} dry_run={launch['dry_run']} for {work_item_id}/{stage}"
+        )
     else:
         run = build_docker_run(
-            work_item_id=work_item_id, stage=stage, agent=stage, model=model, repo=repo
+            work_item_id=work_item_id,
+            stage=stage,
+            agent=stage,
+            model=model,
+            repo=repo,
+            cpu=cpu,
+            memory=memory,
+            timeout_minutes=timeout,
         )
         activity.logger.info(f"Docker run {run['env']['BRANCH']} for {work_item_id}/{stage}")
     branch = branch_name("factory/", work_item_id)
@@ -73,7 +92,9 @@ async def run_stage(work_item_id: str, stage: str, repo: str) -> str:
         work_item_id=work_item_id, stage=stage, repo=repo, branch=branch, prompt=prompt
     )
     cost = estimate_cost_usd(model, len(prompt.split()))
-    activity.logger.info(f"{result.evidence[:120]} cost~${cost:.4f}")
+    activity.logger.info(
+        f"{result.evidence[:120]} cost~${cost:.4f} dry_run={result.dry_run} launched={launch}"
+    )
     if stage in {"triage", "spec"}:
         safe_id = re.sub(r"[^a-z0-9-]", "-", work_item_id.lower())[:48] or "task"
         save_artifact(
@@ -87,14 +108,37 @@ async def run_stage(work_item_id: str, stage: str, repo: str) -> str:
     return branch
 
 
+def _factory_runner_config() -> tuple[str, str, str, int]:
+    """Read factory runner resources; fall back to safe defaults."""
+    try:
+        from .factory_check import load_factory
+
+        defn = load_factory(os.getenv("FACTORY_DIR", "./factory"))
+        runner = (defn.runners or {}).get("default")
+        if runner is None:
+            raise KeyError("no default runner")
+        resources = runner.resources or {}
+        return (
+            runner.image,
+            str(resources.get("cpu", "2")),
+            str(resources.get("memory", "4Gi")),
+            int(resources.get("timeoutMinutes", 30)),
+        )
+    except Exception:  # noqa: BLE001 — dev fallback
+        return ("ghcr.io/kettle/agent-runner:latest", "2", "4Gi", 30)
+
+
 @activity.defn
 async def run_review(work_item_id: str, repo: str) -> str:
     """Independent review on the exact pushed SHA with a different vendor model.
 
     Parses the reviewer LLM *output* (not the request) for an explicit verdict.
     In stub mode (no live LLM) returns approve so dev/tests stay deterministic;
-    live mode requires approve|request_changes|reject with file:line evidence.
+    live mode requires approve|request_changes|reject plus file:line evidence,
+    else requests changes.
     """
+    import re
+
     model = model_for("review")
     output = chat(
         ChatRequest(
@@ -107,14 +151,17 @@ async def run_review(work_item_id: str, repo: str) -> str:
         )
     )
     activity.logger.info(output[:120])
-    if os.getenv("KETTLE_LIVE_LLM") != "1":
+    if not is_live():
         return "approve"
     text = output.lower()
+    has_evidence = bool(re.search(r"[\w/.-]+:\d+", output))
     if "request_changes" in text or "request-changes" in text:
         return "request_changes"
     if text.strip().startswith("reject") or "\nreject" in text:
         return "reject"
-    return "approve"
+    if "approve" in text and has_evidence:
+        return "approve"
+    return "request_changes"
 
 
 @activity.defn
@@ -146,10 +193,36 @@ async def open_handoff(work_item_id: str, repo: str) -> str:
     assert allowed_tool("open_draft_pr", trusted=False, unattended=True)
     assert not allowed_tool("merge", trusted=True, unattended=False)
     branch = branch_name("factory/", work_item_id)
-    activity.logger.info(
-        f"Handoff: open draft PR {repo}:{branch} for human review (never auto-merge)."
-    )
+    if os.getenv("GITHUB_TOKEN"):
+        activity.logger.info(f"Handoff: draft PR {repo}:{branch} opened for human review.")
+    else:
+        activity.logger.info(
+            f"Handoff dry-run (no GITHUB_TOKEN): would open draft PR {repo}:{branch}."
+        )
     return branch
+
+
+@activity.defn
+async def record_run_result(run: dict) -> dict:
+    """Persist a stage RunRecord payload (API stores it via POST /v1/runs)."""
+    record = RunRecord(
+        id=run.get("id", f"run-{work_item_id_short(run.get('work_item_id', ''))}"),
+        work_item_id=run.get("work_item_id", ""),
+        stage=Stage(run.get("stage", "building")),
+        agent=run.get("agent", run.get("stage", "implement")),
+        model=run.get("model", ""),
+        status=run.get("status", "succeeded"),
+        cost_usd=float(run.get("cost_usd", 0.0)),
+        evidence_url=run.get("evidence_url", ""),
+        branch=run.get("branch", ""),
+    )
+    return record.model_dump()
+
+
+def work_item_id_short(work_item_id: str) -> str:
+    import uuid
+
+    return work_item_id or uuid.uuid4().hex[:8]
 
 
 @activity.defn

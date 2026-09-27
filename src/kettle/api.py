@@ -79,13 +79,34 @@ def _factory_repos() -> list[str]:
         return []
 
 
+_RATE: dict[str, list[float]] = {}
+
+
+def _rate_limit(request: Request, *, limit: int = 60, window_s: int = 60) -> None:
+    """Minimal in-process fixed-window limiter for intake routes."""
+    import time
+
+    if os.getenv("KETTLE_RATE_LIMIT", "1") != "1":
+        return
+    key = f"{request.url.path}:{request.client.host if request.client else 'local'}"
+    now = time.time()
+    hits = [t for t in _RATE.get(key, []) if now - t < window_s]
+    if len(hits) >= limit:
+        raise HTTPException(429, "rate limit exceeded")
+    hits.append(now)
+    _RATE[key] = hits[-limit:]
+
+
 @app.get("/health")
 def health() -> dict:
     return {"ok": True}
 
 
 @app.post("/v1/work-items", response_model=WorkItem)
-def create_work_item(payload: CreateWorkItem, _auth: None = Depends(_require_api_key)) -> WorkItem:
+def create_work_item(
+    payload: CreateWorkItem, request: Request, _auth: None = Depends(_require_api_key)
+) -> WorkItem:
+    _rate_limit(request)
     if not repo_allowed(payload.repo, _factory_repos()):
         raise HTTPException(422, "repo not in factory")
     item = WorkItem(
@@ -104,12 +125,17 @@ def create_work_item(payload: CreateWorkItem, _auth: None = Depends(_require_api
 
 
 @app.get("/v1/work-items", response_model=list[WorkItem])
-def list_work_items(stage: Stage | None = None) -> list[WorkItem]:
-    return _STORE.list(stage.value if stage else None)
+def list_work_items(
+    stage: Stage | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    _auth: None = Depends(_require_api_key),
+) -> list[WorkItem]:
+    return _STORE.list(stage.value if stage else None, limit=limit, offset=offset)
 
 
 @app.get("/v1/work-items/{item_id}", response_model=WorkItem)
-def get_work_item(item_id: str) -> WorkItem:
+def get_work_item(item_id: str, _auth: None = Depends(_require_api_key)) -> WorkItem:
     item = _STORE.get(item_id)
     if not item:
         raise HTTPException(404, "work item not found")
@@ -146,6 +172,7 @@ def record_approval(payload: Approval, _auth: None = Depends(_require_api_key)) 
 
 @app.post("/webhooks/github")
 async def github_webhook(request: Request) -> dict:
+    _rate_limit(request)
     raw = await request.body()
     if not verify_github_signature(raw, request.headers.get("X-Hub-Signature-256", "")):
         raise HTTPException(401, "bad webhook signature")
@@ -174,6 +201,7 @@ async def github_webhook(request: Request) -> dict:
 
 @app.post("/webhooks/slack")
 async def slack_webhook(request: Request) -> dict:
+    _rate_limit(request)
     raw = await request.body()
     if not verify_slack_signature(
         raw,
@@ -198,6 +226,7 @@ async def slack_webhook(request: Request) -> dict:
 
 @app.post("/webhooks/linear")
 async def linear_webhook(request: Request) -> dict:
+    _rate_limit(request)
     raw = await request.body()
     if not verify_generic_webhook(
         "LINEAR_WEBHOOK_SECRET", raw, request.headers.get("X-Linear-Signature", "")
@@ -219,6 +248,7 @@ async def linear_webhook(request: Request) -> dict:
 
 @app.post("/webhooks/jira")
 async def jira_webhook(request: Request) -> dict:
+    _rate_limit(request)
     raw = await request.body()
     if not verify_generic_webhook(
         "JIRA_WEBHOOK_SECRET", raw, request.headers.get("X-Jira-Signature", "")
@@ -281,12 +311,12 @@ def create_schedule(payload: ScheduleIn, _auth: None = Depends(_require_api_key)
 
 
 @app.get("/v1/schedules")
-def list_schedules() -> list[dict]:
+def list_schedules(_auth: None = Depends(_require_api_key)) -> list[dict]:
     return _SCHEDULES
 
 
 @app.post("/v1/runs", response_model=RunRecord)
-def record_run(run: RunRecord) -> RunRecord:
+def record_run(run: RunRecord, _auth: None = Depends(_require_api_key)) -> RunRecord:
     if _STORE.get(run.work_item_id) is None:
         raise HTTPException(422, "unknown work_item_id")
     if run.id in _RUNS:
@@ -296,14 +326,22 @@ def record_run(run: RunRecord) -> RunRecord:
 
 
 @app.get("/v1/runs", response_model=list[RunRecord])
-def list_runs(work_item_id: str | None = None) -> list[RunRecord]:
+def list_runs(
+    work_item_id: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    _auth: None = Depends(_require_api_key),
+) -> list[RunRecord]:
+    if limit <= 0 or limit > 500 or offset < 0:
+        raise HTTPException(422, "bad pagination")
+    runs = list(_RUNS.values())
     if work_item_id:
-        return [r for r in _RUNS.values() if r.work_item_id == work_item_id]
-    return list(_RUNS.values())
+        runs = [r for r in runs if r.work_item_id == work_item_id]
+    return runs[offset : offset + limit]
 
 
 @app.get("/v1/runs/{run_id}/logs")
-def run_logs(run_id: str) -> dict:
+def run_logs(run_id: str, _auth: None = Depends(_require_api_key)) -> dict:
     run = _RUNS.get(run_id)
     if not run:
         raise HTTPException(404, "run not found")
@@ -319,7 +357,7 @@ class ScoreIn(BaseModel):
 
 
 @app.post("/v1/scores")
-def record_score(score: ScoreIn) -> dict:
+def record_score(score: ScoreIn, _auth: None = Depends(_require_api_key)) -> dict:
     if len(_SCORES) >= 10000:
         raise HTTPException(429, "score buffer full")
     _SCORES.append(score.model_dump())
@@ -327,7 +365,7 @@ def record_score(score: ScoreIn) -> dict:
 
 
 @app.get("/v1/dashboard")
-def dashboard() -> dict:
+def dashboard(_auth: None = Depends(_require_api_key)) -> dict:
     by_stage: dict[str, int] = {}
     for w in _STORE.list():
         by_stage[w.current_stage.value] = by_stage.get(w.current_stage.value, 0) + 1

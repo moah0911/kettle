@@ -36,10 +36,15 @@ class WorkItemStore:
     def get(self, item_id: str) -> WorkItem | None:
         return self._items.get(item_id)
 
-    def list(self, stage: str | None = None) -> list[WorkItem]:
+    def list(
+        self, stage: str | None = None, *, limit: int = 100, offset: int = 0
+    ) -> list[WorkItem]:
+        if limit <= 0 or limit > 500 or offset < 0:
+            raise ValueError("bad pagination")
+        items = list(self._items.values())
         if stage:
-            return [w for w in self._items.values() if w.current_stage.value == stage]
-        return list(self._items.values())
+            items = [w for w in items if w.current_stage.value == stage]
+        return items[offset : offset + limit]
 
     def clear(self) -> None:
         self._items.clear()

@@ -14,18 +14,40 @@ class ChatRequest:
     max_tokens: int = 2000
 
 
-def chat(req: ChatRequest) -> str:
-    """Route via LiteLLM if configured, else deterministic stub for tests/dev."""
-    if os.getenv("KETTLE_LIVE_LLM") != "1":
+def is_live() -> bool:
+    return os.getenv("KETTLE_LIVE_LLM") == "1"
+
+
+def chat(req: ChatRequest, *, timeout_s: int = 60, num_retries: int = 3) -> str:
+    """Route via LiteLLM when KETTLE_LIVE_LLM=1, else explicit deterministic stub.
+
+    Live path forwards timeout/retries and maps provider errors to RuntimeError
+    with model context. Stub path is marked [stub:...] so callers never mistake
+    it for a real verdict.
+    """
+    if not is_live():
         return f"[stub:{req.model}] {req.user[:200]}"
     import litellm  # lazy so tests don't require keys
 
-    resp = litellm.completion(
-        model=req.model,
-        messages=[{"role": "system", "content": req.system}, {"role": "user", "content": req.user}],
-        max_tokens=req.max_tokens,
-    )
-    return resp.choices[0].message.content or ""
+    last: Exception | None = None
+    for attempt in range(max(num_retries, 1)):
+        try:
+            resp = litellm.completion(
+                model=req.model,
+                messages=[
+                    {"role": "system", "content": req.system},
+                    {"role": "user", "content": req.user},
+                ],
+                max_tokens=req.max_tokens,
+                timeout=timeout_s,
+            )
+            content = resp.choices[0].message.content or ""
+            if not content.strip():
+                raise RuntimeError(f"empty completion from {req.model}")
+            return content
+        except Exception as exc:  # noqa: BLE001 — mapped below with context
+            last = exc
+    raise RuntimeError(f"LLM call failed for {req.model} after {num_retries} tries: {last}")
 
 
 # Central model map — one-line swap per stage. Review vendor must differ

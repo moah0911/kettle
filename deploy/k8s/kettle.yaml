@@ -2,6 +2,30 @@ apiVersion: v1
 kind: Namespace
 metadata: { name: kettle }
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: kettle-worker, namespace: kettle }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: kettle-worker, namespace: kettle }
+rules:
+  - { apiGroups: ["batch"], resources: ["jobs"], verbs: ["create", "get", "list", "delete"] }
+  - { apiGroups: [""], resources: ["pods", "pods/log"], verbs: ["get", "list"] }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: kettle-worker, namespace: kettle }
+subjects: [{ kind: ServiceAccount, name: kettle-worker, namespace: kettle }]
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: kettle-worker }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: kettle-api, namespace: kettle }
+spec:
+  selector: { app: kettle-api }
+  ports: [{ name: http, port: 8000, targetPort: 8000 }]
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata: { name: kettle-api, namespace: kettle }
@@ -11,14 +35,17 @@ spec:
   template:
     metadata: { labels: { app: kettle-api } }
     spec:
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       containers:
         - name: api
           image: ghcr.io/kettle/kettle:latest
           command: ["uvicorn", "kettle.api:app", "--host", "0.0.0.0", "--port", "8000"]
           ports: [{ containerPort: 8000 }]
+          resources: { requests: { cpu: "250m", memory: "512Mi" }, limits: { cpu: "1", memory: "1Gi" } }
+          securityContext: { allowPrivilegeEscalation: false, runAsNonRoot: true }
           env:
             - { name: DATABASE_URL, valueFrom: { secretKeyRef: { name: kettle-secrets, key: database-url } } }
-            - { name: TEMPORAL_HOST, value: "temporal:7233" }
+            - { name: TEMPORAL_HOST, value: "temporal.kettle.svc:7233" }
           livenessProbe: { httpGet: { path: /health, port: 8000 }, initialDelaySeconds: 10 }
           readinessProbe: { httpGet: { path: /health, port: 8000 }, initialDelaySeconds: 5 }
 ---
@@ -31,27 +58,34 @@ spec:
   template:
     metadata: { labels: { app: kettle-worker } }
     spec:
+      serviceAccountName: kettle-worker
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
       containers:
         - name: worker
           image: ghcr.io/kettle/kettle:latest
           command: ["python", "-m", "kettle.worker"]
+          resources: { requests: { cpu: "250m", memory: "512Mi" }, limits: { cpu: "1", memory: "1Gi" } }
+          securityContext: { allowPrivilegeEscalation: false, runAsNonRoot: true }
           env:
-            - { name: TEMPORAL_HOST, value: "temporal:7233" }
+            - { name: TEMPORAL_HOST, value: "temporal.kettle.svc:7233" }
             - { name: TEMPORAL_TASK_QUEUE, value: "kettle" }
             - { name: RUNNER_BACKEND, value: "kubernetes" }
             - { name: K8S_NAMESPACE, value: "kettle" }
 ---
-# KEDA autoscale workers on Temporal queue depth (kron pattern).
+# KEDA autoscale workers on CPU (valid stock trigger; swap to prometheus
+# queue-depth when metrics are available).
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata: { name: kettle-worker, namespace: kettle }
 spec:
-  scaleTargetRef: { name: kettle-worker }
-  minReplicaCount: 1
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: kettle-worker }
+  pollingInterval: 15
+  cooldownPeriod: 60
+  minReplicaCount: 2
   maxReplicaCount: 10
   triggers:
-    - type: temporal
-      metadata: { taskQueue: "kettle", targetValue: "5" }
+    - type: cpu
+      metadata: { type: Utilization, value: "70" }
 ---
 # Scheduled intake (direct runs on a timer).
 apiVersion: batch/v1
@@ -59,12 +93,20 @@ kind: CronJob
 metadata: { name: kettle-schedule, namespace: kettle }
 spec:
   schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
+      activeDeadlineSeconds: 300
+      ttlSecondsAfterFinished: 3600
       template:
         spec:
           restartPolicy: Never
+          securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
           containers:
             - name: dispatch
               image: ghcr.io/kettle/kettle:latest
-              command: ["python", "-c", "print('dispatch schedules via /v1/schedules')"]
+              resources: { requests: { cpu: "100m", memory: "128Mi" }, limits: { cpu: "250m", memory: "256Mi" } }
+              securityContext: { allowPrivilegeEscalation: false, runAsNonRoot: true }
+              command: ["python", "-m", "kettle.dispatch_schedules"]

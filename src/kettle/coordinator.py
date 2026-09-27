@@ -41,9 +41,9 @@ def classify(item: WorkItem) -> TriageVerdict:
     if labels & TRIVIAL_LABELS:
         itype = "chore"
     return TriageVerdict(
-        type=itype,
+        type=itype,  # type: ignore[arg-type]
         priority="p2",
-        complexity=complexity,
+        complexity=complexity,  # type: ignore[arg-type]
         actionable=True,
         reason="heuristic classification",
     )

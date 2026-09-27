@@ -14,6 +14,7 @@ from .activities import (
     decide_after_triage,
     decide_initial_stage,
     open_handoff,
+    record_run_result,
     run_review,
     run_stage,
     score_run,
@@ -36,6 +37,7 @@ async def main() -> None:
             run_stage,
             run_review,
             open_handoff,
+            record_run_result,
             score_run,
         ],
     )

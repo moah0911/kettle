@@ -44,6 +44,29 @@ def skill_env(skills: list[str], mcp_servers: list[dict] | None = None) -> dict:
     }
 
 
+def apply_job(spec: dict) -> dict:
+    """Apply a Job spec, or return explicit dry-run when no cluster is configured.
+
+    Real apply happens only when KETTLE_LIVE_K8S=1 and the `kubernetes` client
+    is importable; otherwise returns {"applied": False, "dry_run": True}.
+    """
+    import os
+
+    if os.getenv("KETTLE_LIVE_K8S") != "1":
+        return {"applied": False, "dry_run": True, "job": spec["metadata"]["name"]}
+    try:
+        from kubernetes import client, config  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("kubernetes client not installed") from exc
+    try:
+        config.load_incluster_config()
+    except Exception:  # noqa: BLE001 — fall back to kubeconfig
+        config.load_kube_config()
+    batch = client.BatchV1Api()
+    created = batch.create_namespaced_job(namespace=spec["metadata"]["namespace"], body=spec)
+    return {"applied": True, "dry_run": False, "job": created.metadata.name}
+
+
 def build_k8s_job(
     *,
     namespace: str,
