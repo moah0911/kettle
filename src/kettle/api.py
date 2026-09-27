@@ -174,5 +174,5 @@ def factory_info() -> dict:
     try:
         defn: FactoryDefinition = load_factory("./factory")
         return {"name": defn.factory_name, "agents": sorted(defn.agents), "repos": defn.repos}
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         raise HTTPException(500, str(exc))

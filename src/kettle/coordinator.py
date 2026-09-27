@@ -29,9 +29,7 @@ def needs_planning(item: WorkItem, triage_complexity: str = "") -> bool:
         return False
     if triage_complexity.lower() in {"xs", "s", "trivial"}:
         return False
-    if len(item.body or "") < 200 and not triage_complexity:
-        return False
-    return True
+    return not (len(item.body or "") < 200 and not triage_complexity)
 
 
 def route_after_triage(item: WorkItem, triage_complexity: str = "") -> Stage:
