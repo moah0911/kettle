@@ -79,16 +79,16 @@ class CoordinatorWorkflow:
                 args=[work_item_id, "implement", repo],
                 start_to_close_timeout=timedelta(minutes=60),
             )
-                verdict = await workflow.execute_activity(
-                    activities.run_review,
-                    args=[work_item_id, repo],
-                    start_to_close_timeout=timedelta(minutes=30),
-                )
-                if verdict == ReviewVerdict.APPROVE.value or revisions >= MAX_REVISION_CYCLES:
-                    break
-                if verdict == ReviewVerdict.REJECT.value:
-                    break
-                revisions += 1
+            verdict = await workflow.execute_activity(
+                activities.run_review,
+                args=[work_item_id, repo],
+                start_to_close_timeout=timedelta(minutes=30),
+            )
+            if verdict == ReviewVerdict.APPROVE.value or revisions >= MAX_REVISION_CYCLES:
+                break
+            if verdict == ReviewVerdict.REJECT.value:
+                break
+            revisions += 1
         await workflow.execute_activity(
             activities.open_handoff,
             args=[work_item_id, repo],
