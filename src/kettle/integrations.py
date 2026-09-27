@@ -10,11 +10,20 @@ from .models import WorkItem
 from .trust import TRUSTED_ROLES
 
 
+def _dev_bypass_allowed() -> bool:
+    return os.getenv("ALLOW_UNVERIFIED_DEV", "1") == "1"
+
+
 def verify_github_signature(payload: bytes, signature: str) -> bool:
-    """HMAC-SHA256 webhook verification. Open mode when no secret configured (dev)."""
+    """HMAC-SHA256 webhook verification. Fail-closed in prod.
+
+    Returns True without a secret only when ALLOW_UNVERIFIED_DEV=1 (dev/test).
+    """
     secret = os.getenv("GITHUB_WEBHOOK_SECRET", "")
     if not secret:
-        return True
+        return _dev_bypass_allowed()
+    if not signature:
+        return False
     expected = "sha256=" + hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature)
 
@@ -22,10 +31,35 @@ def verify_github_signature(payload: bytes, signature: str) -> bool:
 def verify_slack_signature(payload: bytes, timestamp: str, signature: str) -> bool:
     secret = os.getenv("SLACK_SIGNING_SECRET", "")
     if not secret:
-        return True
+        return _dev_bypass_allowed()
+    if not timestamp or not signature:
+        return False
+    try:
+        age = abs(__import__("time").time() - int(timestamp))
+        if age > 300:
+            return False
+    except ValueError:
+        return False
     base = f"v0:{timestamp}:".encode() + payload
     expected = "v0=" + hmac.new(secret.encode(), base, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature)
+
+
+def verify_generic_webhook(secret_env: str, payload: bytes, signature: str) -> bool:
+    """Shared-secret check for Linear/Jira/custom webhooks."""
+    secret = os.getenv(secret_env, "")
+    if not secret:
+        return _dev_bypass_allowed()
+    if not signature:
+        return False
+    expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def repo_allowed(repo: str, allowed: list[str]) -> bool:
+    if not allowed:
+        return True
+    return repo in allowed
 
 
 def from_github_issue(

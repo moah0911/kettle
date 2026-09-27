@@ -2,16 +2,28 @@
 
 from __future__ import annotations
 
+import os
 import uuid
+from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .automations import Automation, match_automation
 from .factory_check import FactoryDefinition, load_factory
-from .integrations import from_github_issue, from_jira, from_linear, from_slack
+from .integrations import (
+    from_github_issue,
+    from_jira,
+    from_linear,
+    from_slack,
+    repo_allowed,
+    verify_generic_webhook,
+    verify_github_signature,
+    verify_slack_signature,
+)
 from .models import RunRecord, Stage, WorkItem, WorkItemStatus
 from .store import WorkItemStore
+from .trust import allowed_tool
 
 app = FastAPI(title="kettle", version="0.1.0")
 
@@ -45,10 +57,26 @@ class CreateWorkItem(BaseModel):
 
 
 class Approval(BaseModel):
-    work_item_id: str
-    kind: str = "spec"  # spec|question|merge
+    work_item_id: str = Field(min_length=1)
+    kind: Literal["spec", "question", "merge"] = "spec"
     approved: bool = True
-    note: str = ""
+    note: str = Field(default="", max_length=5000)
+    actor: str = Field(default="", max_length=200)
+
+
+def _require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    expected = os.getenv("KETTLE_API_KEY", "")
+    if not expected:
+        return
+    if x_api_key != expected:
+        raise HTTPException(401, "invalid api key")
+
+
+def _factory_repos() -> list[str]:
+    try:
+        return load_factory(os.getenv("FACTORY_DIR", "./factory")).repos
+    except (OSError, ValueError):
+        return []
 
 
 @app.get("/health")
@@ -57,7 +85,9 @@ def health() -> dict:
 
 
 @app.post("/v1/work-items", response_model=WorkItem)
-def create_work_item(payload: CreateWorkItem) -> WorkItem:
+def create_work_item(payload: CreateWorkItem, _auth: None = Depends(_require_api_key)) -> WorkItem:
+    if not repo_allowed(payload.repo, _factory_repos()):
+        raise HTTPException(422, "repo not in factory")
     item = WorkItem(
         id=f"wi-{uuid.uuid4().hex[:8]}",
         source=payload.source,
@@ -74,8 +104,8 @@ def create_work_item(payload: CreateWorkItem) -> WorkItem:
 
 
 @app.get("/v1/work-items", response_model=list[WorkItem])
-def list_work_items(stage: str | None = None) -> list[WorkItem]:
-    return _STORE.list(stage)
+def list_work_items(stage: Stage | None = None) -> list[WorkItem]:
+    return _STORE.list(stage.value if stage else None)
 
 
 @app.get("/v1/work-items/{item_id}", response_model=WorkItem)
@@ -87,24 +117,46 @@ def get_work_item(item_id: str) -> WorkItem:
 
 
 @app.post("/v1/approvals")
-def record_approval(payload: Approval) -> dict:
+def record_approval(payload: Approval, _auth: None = Depends(_require_api_key)) -> dict:
     item = _STORE.get(payload.work_item_id)
     if not item:
         raise HTTPException(404, "work item not found")
+    transitioned = False
     # Spec approval unblocks planning->building; merge stays human in git host.
+    if payload.kind == "merge":
+        return {
+            "ok": True,
+            "kind": payload.kind,
+            "approved": False,
+            "transitioned": False,
+            "reason": "agents never merge",
+        }
     if payload.kind == "spec" and payload.approved and item.current_stage == Stage.PLANNING:
         item.current_stage = Stage.BUILDING
         item.status = WorkItemStatus.BUILDING
-    return {"ok": True, "kind": payload.kind, "approved": payload.approved}
+        _STORE.update(item)
+        transitioned = True
+    return {
+        "ok": True,
+        "kind": payload.kind,
+        "approved": payload.approved,
+        "transitioned": transitioned,
+    }
 
 
 @app.post("/webhooks/github")
-def github_webhook(event: dict) -> dict:
+async def github_webhook(request: Request) -> dict:
+    raw = await request.body()
+    if not verify_github_signature(raw, request.headers.get("X-Hub-Signature-256", "")):
+        raise HTTPException(401, "bad webhook signature")
+    event = await request.json()
     etype = event.get("type", "github.issue_labeled")
     auto = match_automation(etype, event.get("context", {}), _AUTOMATIONS)
     if not auto:
         return {"ok": True, "routed": False}
     ctx = event.get("context", {})
+    if not repo_allowed(ctx.get("repo", ""), _factory_repos()):
+        return {"ok": True, "routed": False, "reason": "repo not in factory"}
     item = from_github_issue(
         issue_id=str(ctx.get("issue_id", "0")),
         title=ctx.get("title", "untitled"),
@@ -116,12 +168,22 @@ def github_webhook(event: dict) -> dict:
     )
     if not item:
         return {"ok": True, "routed": False, "reason": "untrusted or missing factory label"}
-    _STORE.put(item, idempotency_key=f"github:{item.source_id}:{etype}")
-    return {"ok": True, "routed": True, "work_item_id": item.id, "via": auto.name}
+    stored = _STORE.put(item, idempotency_key=f"github:{item.source_id}")
+    return {"ok": True, "routed": True, "work_item_id": stored.id, "via": auto.name}
 
 
 @app.post("/webhooks/slack")
-def slack_webhook(event: dict) -> dict:
+async def slack_webhook(request: Request) -> dict:
+    raw = await request.body()
+    if not verify_slack_signature(
+        raw,
+        request.headers.get("X-Slack-Request-Timestamp", ""),
+        request.headers.get("X-Slack-Signature", ""),
+    ):
+        raise HTTPException(401, "bad webhook signature")
+    event = await request.json()
+    if not repo_allowed(event.get("repo", ""), _factory_repos()):
+        raise HTTPException(422, "repo not in factory")
     item = from_slack(
         channel=event.get("channel", "general"),
         user=event.get("user", "u"),
@@ -129,12 +191,21 @@ def slack_webhook(event: dict) -> dict:
         repo=event.get("repo", ""),
         item_id=f"wi-{uuid.uuid4().hex[:8]}",
     )
-    _STORE.put(item)
-    return {"ok": True, "work_item_id": item.id}
+    key = event.get("event_id", "")
+    stored = _STORE.put(item, idempotency_key=f"slack:{key}" if key else "")
+    return {"ok": True, "work_item_id": stored.id}
 
 
 @app.post("/webhooks/linear")
-def linear_webhook(event: dict) -> dict:
+async def linear_webhook(request: Request) -> dict:
+    raw = await request.body()
+    if not verify_generic_webhook(
+        "LINEAR_WEBHOOK_SECRET", raw, request.headers.get("X-Linear-Signature", "")
+    ):
+        raise HTTPException(401, "bad webhook signature")
+    event = await request.json()
+    if not repo_allowed(event.get("repo", ""), _factory_repos()):
+        raise HTTPException(422, "repo not in factory")
     item = from_linear(
         issue_id=event.get("issue_id", "lin-0"),
         title=event.get("title", "untitled"),
@@ -142,12 +213,20 @@ def linear_webhook(event: dict) -> dict:
         repo=event.get("repo", ""),
         item_id=f"wi-{uuid.uuid4().hex[:8]}",
     )
-    _STORE.put(item, idempotency_key=f"linear:{item.source_id}")
-    return {"ok": True, "work_item_id": item.id}
+    stored = _STORE.put(item, idempotency_key=f"linear:{item.source_id}")
+    return {"ok": True, "work_item_id": stored.id}
 
 
 @app.post("/webhooks/jira")
-def jira_webhook(event: dict) -> dict:
+async def jira_webhook(request: Request) -> dict:
+    raw = await request.body()
+    if not verify_generic_webhook(
+        "JIRA_WEBHOOK_SECRET", raw, request.headers.get("X-Jira-Signature", "")
+    ):
+        raise HTTPException(401, "bad webhook signature")
+    event = await request.json()
+    if not repo_allowed(event.get("repo", ""), _factory_repos()):
+        raise HTTPException(422, "repo not in factory")
     item = from_jira(
         key=event.get("key", "J-0"),
         title=event.get("title", "untitled"),
@@ -155,12 +234,14 @@ def jira_webhook(event: dict) -> dict:
         repo=event.get("repo", ""),
         item_id=f"wi-{uuid.uuid4().hex[:8]}",
     )
-    _STORE.put(item, idempotency_key=f"jira:{item.source_id}")
-    return {"ok": True, "work_item_id": item.id}
+    stored = _STORE.put(item, idempotency_key=f"jira:{item.source_id}")
+    return {"ok": True, "work_item_id": stored.id}
 
 
 @app.post("/webhooks/custom")
-def custom_webhook(event: dict) -> dict:
+def custom_webhook(event: dict, _auth: None = Depends(_require_api_key)) -> dict:
+    if not repo_allowed(event.get("repo", ""), _factory_repos()):
+        raise HTTPException(422, "repo not in factory")
     return create_work_item(
         CreateWorkItem(
             source="webhook",
@@ -175,22 +256,26 @@ def custom_webhook(event: dict) -> dict:
 @app.get("/v1/factory")
 def factory_info() -> dict:
     try:
-        defn: FactoryDefinition = load_factory("./factory")
+        defn: FactoryDefinition = load_factory(os.getenv("FACTORY_DIR", "./factory"))
         return {"name": defn.factory_name, "agents": sorted(defn.agents), "repos": defn.repos}
-    except (OSError, ValueError) as exc:
-        raise HTTPException(500, str(exc))
+    except (OSError, ValueError):
+        raise HTTPException(500, "factory load failed")
 
 
 class ScheduleIn(BaseModel):
-    name: str
-    cron: str
+    name: str = Field(min_length=1, max_length=100)
+    cron: str = Field(min_length=1, max_length=100)
     action: str = "coordinator"
     repo: str = ""
 
 
 @app.post("/v1/schedules")
-def create_schedule(payload: ScheduleIn) -> dict:
-    entry = {"id": f"sch-{uuid.uuid4().hex[:6]}", **payload.model_dump()}
+def create_schedule(payload: ScheduleIn, _auth: None = Depends(_require_api_key)) -> dict:
+    import re
+
+    if not re.match(r"^[\w/*,\- ]+$", payload.cron):
+        raise HTTPException(422, "bad cron expression")
+    entry = {"id": f"sch-{uuid.uuid4().hex[:12]}", **payload.model_dump()}
     _SCHEDULES.append(entry)
     return entry
 
@@ -202,6 +287,10 @@ def list_schedules() -> list[dict]:
 
 @app.post("/v1/runs", response_model=RunRecord)
 def record_run(run: RunRecord) -> RunRecord:
+    if _STORE.get(run.work_item_id) is None:
+        raise HTTPException(422, "unknown work_item_id")
+    if run.id in _RUNS:
+        raise HTTPException(409, "run id already exists")
     _RUNS[run.id] = run
     return run
 
@@ -222,9 +311,18 @@ def run_logs(run_id: str) -> dict:
     return {"run_id": run_id, "branch": run.branch, "evidence_url": run.evidence_url}
 
 
+class ScoreIn(BaseModel):
+    scorer: str = Field(min_length=1, max_length=100)
+    passed: bool
+    reason: str = Field(default="", max_length=2000)
+    run_id: str = Field(default="", max_length=100)
+
+
 @app.post("/v1/scores")
-def record_score(score: dict) -> dict:
-    _SCORES.append(score)
+def record_score(score: ScoreIn) -> dict:
+    if len(_SCORES) >= 10000:
+        raise HTTPException(429, "score buffer full")
+    _SCORES.append(score.model_dump())
     return {"ok": True, "total": len(_SCORES)}
 
 
@@ -243,17 +341,17 @@ def dashboard() -> dict:
 
 
 @app.post("/v1/work-items/{item_id}/dispatch")
-def dispatch_work_item(item_id: str) -> dict:
+def dispatch_work_item(item_id: str, _auth: None = Depends(_require_api_key)) -> dict:
     """Start/signal the Temporal CoordinatorWorkflow (kron gateway pattern).
 
     v0.1 returns the workflow ID without requiring a live server when
     `TEMPORAL_HOST` is unset; the worker picks it up when configured.
     """
-    import os
-
     item = _STORE.get(item_id)
     if not item:
         raise HTTPException(404, "work item not found")
+    if not allowed_tool("open_draft_pr", trusted=item.trusted, unattended=not item.trusted):
+        raise HTTPException(403, "delivery not allowed for this work item")
     workflow_id = f"kettle-{item.id}"
     host = os.getenv("TEMPORAL_HOST", "")
     if not host:

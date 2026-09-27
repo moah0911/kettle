@@ -19,15 +19,29 @@ def score_tests_pass(test_exit_code: int) -> Score:
     )
 
 
-def score_criteria_met(met: int, total: int) -> Score:
+def score_criteria_met(met: int, total: int, evidence_refs: int = 0) -> Score:
+    if total <= 0:
+        return Score(scorer="criteria-met", passed=False, reason="no criteria defined")
+    if met > total:
+        return Score(
+            scorer="criteria-met", passed=False, reason=f"{met}/{total} invalid: met > total"
+        )
+    if met == total and evidence_refs < total:
+        return Score(
+            scorer="criteria-met", passed=False, reason=f"{met}/{total} missing file:line evidence"
+        )
     return Score(
         scorer="criteria-met",
-        passed=total > 0 and met == total,
+        passed=met == total,
         reason=f"{met}/{total} criteria with evidence",
     )
 
 
 def group_failures(scores: list[Score]) -> str:
+    by_name = {s.scorer: s for s in scores}
+    review = by_name.get("review")
+    if review is not None and not review.passed:
+        return "review-reject"
     failed = [s.scorer for s in scores if not s.passed]
     if not failed:
         return "none"
@@ -45,9 +59,10 @@ class BenchmarkResult(BaseModel):
 
 def compare_benchmarks(results: list[BenchmarkResult]) -> BenchmarkResult | None:
     """Pick best pass-rate, break ties on cost (snowl-style cost-aware scoring)."""
-    if not results:
+    measured = [r for r in results if r.total > 0]
+    if not measured:
         return None
-    return min(results, key=lambda r: (-(r.passed / max(r.total, 1)), r.cost_usd))
+    return min(measured, key=lambda r: (-(r.passed / r.total), r.cost_usd))
 
 
 class FrontierEntry(BaseModel):
@@ -61,7 +76,10 @@ class FrontierEntry(BaseModel):
 def update_frontier(
     frontier: list[FrontierEntry], candidate: FrontierEntry, size: int = 3
 ) -> list[FrontierEntry]:
-    merged = sorted([*frontier, candidate], key=lambda e: -e.score)[:size]
+    if size <= 0:
+        raise ValueError("frontier size must be >= 1")
+    deduped = [e for e in frontier if e.name != candidate.name]
+    merged = sorted([*deduped, candidate], key=lambda e: -e.score)[:size]
     return merged
 
 

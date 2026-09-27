@@ -41,5 +41,38 @@ def test_branch_and_docker():
 def test_scorers():
     assert score_tests_pass(0).passed is True
     assert score_tests_pass(1).passed is False
-    assert score_criteria_met(3, 3).passed is True
-    assert group_failures([score_tests_pass(1), score_criteria_met(3, 3)]) == "test-failures"
+    assert score_criteria_met(3, 3, evidence_refs=3).passed is True
+    assert score_criteria_met(3, 3).passed is False  # missing file:line evidence
+    assert score_criteria_met(0, 0).passed is False
+    assert group_failures([score_tests_pass(1), score_criteria_met(3, 3, 3)]) == "test-failures"
+
+
+def test_job_name_dns_limit():
+    spec = build_k8s_job(
+        namespace="kettle",
+        work_item_id="wi-" + "a" * 100,
+        stage="building",
+        agent="implement",
+        model="m",
+        repo="acme/app",
+    )
+    assert len(spec["metadata"]["name"]) <= 63
+
+
+def test_repo_url_rejects_evil():
+    from kettle.runners import validate_repo_url as v
+
+    for bad in [
+        "https://evil.com/a/b",
+        "http://github.com/a/b",
+        "git@github.com:acme/app",
+        "https://github.com.evil.com/a/b",
+        "a/b/../../evil",
+        "not a url!!!",
+    ]:
+        try:
+            v(bad)
+            raise AssertionError(f"should raise for {bad}")
+        except ValueError:
+            pass
+    assert v("https://github.com/acme/app") == "https://github.com/acme/app.git"

@@ -17,14 +17,23 @@ def branch_name(prefix: str, work_item_id: str) -> str:
 
 
 def validate_repo_url(url: str) -> str:
-    """Brokered git: only validated literal URLs, never mutable remote config."""
-    if not _GH.match(url) and "/" not in url:
-        raise ValueError(f"bad repo url: {url}")
-    if url.startswith("https://github.com/"):
-        if not _GH.match(url):
+    """Brokered git: only validated literal URLs, never mutable remote config.
+
+    Allows `owner/repo` short form and `https://github.com/owner/repo[.git]`.
+    Rejects other hosts, ssh/scp syntax, traversal, and blank segments.
+    """
+    short = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+    if short.match(url or ""):
+        if ".." in url:
             raise ValueError(f"bad repo url: {url}")
-        return url[:-4] + ".git" if not url.endswith(".git") else url
-    return url  # short form owner/repo allowed for dev
+        return url
+    if not _GH.match(url or ""):
+        raise ValueError(f"bad repo url: {url}")
+    if ".." in url:
+        raise ValueError(f"bad repo url: {url}")
+    if url.endswith(".git"):
+        return url
+    return url + ".git"
 
 
 def skill_env(skills: list[str], mcp_servers: list[dict] | None = None) -> dict:
@@ -51,8 +60,10 @@ def build_k8s_job(
     skills: list[str] | None = None,
     mcp_servers: list[dict] | None = None,
 ) -> dict:
+    if timeout_minutes <= 0 or timeout_minutes > 120:
+        raise ValueError("timeout_minutes must be 1..120")
     branch = branch_name(branch_prefix, work_item_id)
-    job_name = f"kettle-{slugify(work_item_id)}-{slugify(stage)}"
+    job_name = f"kettle-{slugify(work_item_id)}-{slugify(stage)}"[:63].rstrip("-")
     extra = skill_env(skills or [], mcp_servers)
     return {
         "apiVersion": "batch/v1",
@@ -103,10 +114,16 @@ def build_docker_run(
     model: str,
     repo: str,
     branch_prefix: str = "factory/",
+    cpu: str = "2",
+    memory: str = "4Gi",
+    timeout_minutes: int = 30,
 ) -> dict:
+    if timeout_minutes <= 0 or timeout_minutes > 120:
+        raise ValueError("timeout_minutes must be 1..120")
     return {
         "backend": "docker",
         "image": "ghcr.io/kettle/agent-runner:latest",
+        "resources": {"cpu": cpu, "memory": memory, "timeoutMinutes": timeout_minutes},
         "env": {
             "WORK_ITEM_ID": work_item_id,
             "STAGE": stage,

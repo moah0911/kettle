@@ -20,4 +20,6 @@ def is_trusted_role(role: str) -> bool:
 def allowed_tool(tool: str, trusted: bool, unattended: bool) -> bool:
     if tool == "merge":
         return False
-    return not (unattended and tool not in UNATTENDED_ALLOW)
+    if trusted and not unattended:
+        return True
+    return tool in UNATTENDED_ALLOW

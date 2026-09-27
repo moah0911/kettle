@@ -17,10 +17,20 @@ class WorkItemStore:
 
     def put(self, item: WorkItem, idempotency_key: str = "") -> WorkItem:
         if idempotency_key and idempotency_key in self._idempotency:
-            return self._items[self._idempotency[idempotency_key]]
+            existing_id = self._idempotency[idempotency_key]
+            existing = self._items.get(existing_id)
+            if existing is not None:
+                return existing
         self._items[item.id] = item
         if idempotency_key:
             self._idempotency[idempotency_key] = item.id
+        return item
+
+    def update(self, item: WorkItem) -> WorkItem:
+        """Explicit persist — replaces in-place mutation for Postgres backends."""
+        if item.id not in self._items:
+            raise KeyError(f"work item not found: {item.id}")
+        self._items[item.id] = item
         return item
 
     def get(self, item_id: str) -> WorkItem | None:

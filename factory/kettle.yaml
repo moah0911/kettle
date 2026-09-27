@@ -29,15 +29,15 @@ agents:
 
 automations:
   - name: "bug-issues"
-    on: "github.issue_labeled"
+    "on": "github.issue_labeled"
     if: "label == 'factory' and permission >= 'triage'"
     do: "coordinator"
   - name: "mention"
-    on: "github.comment"
+    "on": "github.comment"
     if: "mentions contains 'foreman' and role in ['OWNER','MEMBER','COLLABORATOR']"
     do: "coordinator"
   - name: "ci-fix"
-    on: "github.check_suite.failed"
+    "on": "github.check_suite.failed"
     if: "branch startswith 'factory/'"
     do: "coordinator"
 

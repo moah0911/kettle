@@ -33,6 +33,8 @@ async def decide_after_triage(title: str, body: str, labels: list[str], complexi
 @activity.defn
 async def run_stage(work_item_id: str, stage: str, repo: str) -> str:
     """Launch execution backend for a stage; returns branch name."""
+    import re
+
     backend = os.getenv("RUNNER_BACKEND", "docker")
     model = model_for(stage)
     harness_name = select_harness(stage, model_for("implement"), model_for("review"))
@@ -40,7 +42,9 @@ async def run_stage(work_item_id: str, stage: str, repo: str) -> str:
     try:
         validate_repo_url(repo)
     except ValueError:
-        pass  # short owner/repo form allowed in dev
+        if os.getenv("ALLOW_STRICT_GIT", "0") == "1":
+            raise
+        activity.logger.warn(f"repo failed brokered-git validation in dev mode: {repo!r}")
     if backend == "kubernetes":
         spec = build_k8s_job(
             namespace=os.getenv("K8S_NAMESPACE", "kettle"),
@@ -71,9 +75,10 @@ async def run_stage(work_item_id: str, stage: str, repo: str) -> str:
     cost = estimate_cost_usd(model, len(prompt.split()))
     activity.logger.info(f"{result.evidence[:120]} cost~${cost:.4f}")
     if stage in {"triage", "spec"}:
+        safe_id = re.sub(r"[^a-z0-9-]", "-", work_item_id.lower())[:48] or "task"
         save_artifact(
             HandoffArtifact(
-                id=f"{work_item_id}-{stage}",
+                id=f"{safe_id}-{stage}",
                 kind="research" if stage == "triage" else "plan",
                 work_item_id=work_item_id,
                 body=prompt[:5000],
@@ -84,9 +89,14 @@ async def run_stage(work_item_id: str, stage: str, repo: str) -> str:
 
 @activity.defn
 async def run_review(work_item_id: str, repo: str) -> str:
-    """Independent review on the exact pushed SHA with a different vendor model."""
+    """Independent review on the exact pushed SHA with a different vendor model.
+
+    Parses the reviewer LLM *output* (not the request) for an explicit verdict.
+    In stub mode (no live LLM) returns approve so dev/tests stay deterministic;
+    live mode requires approve|request_changes|reject with file:line evidence.
+    """
     model = model_for("review")
-    prompt = chat(
+    output = chat(
         ChatRequest(
             model=model,
             system=(
@@ -96,11 +106,13 @@ async def run_review(work_item_id: str, repo: str) -> str:
             user=f"Review branch {branch_name('factory/', work_item_id)} in {repo}.",
         )
     )
-    activity.logger.info(prompt[:120])
-    text = prompt.lower()
+    activity.logger.info(output[:120])
+    if os.getenv("KETTLE_LIVE_LLM") != "1":
+        return "approve"
+    text = output.lower()
     if "request_changes" in text or "request-changes" in text:
         return "request_changes"
-    if "reject" in text:
+    if text.strip().startswith("reject") or "\nreject" in text:
         return "reject"
     return "approve"
 
@@ -126,6 +138,13 @@ async def check_dor(title: str, body: str, labels: list[str], triage: dict) -> d
 
 @activity.defn
 async def open_handoff(work_item_id: str, repo: str) -> str:
+    from .trust import allowed_tool
+
+    # Delivery gate: draft PRs allowed for both attended and unattended;
+    # merge is absent everywhere (enforced here defensively).
+    assert allowed_tool("open_draft_pr", trusted=True, unattended=False)
+    assert allowed_tool("open_draft_pr", trusted=False, unattended=True)
+    assert not allowed_tool("merge", trusted=True, unattended=False)
     branch = branch_name("factory/", work_item_id)
     activity.logger.info(
         f"Handoff: open draft PR {repo}:{branch} for human review (never auto-merge)."

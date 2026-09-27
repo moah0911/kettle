@@ -93,9 +93,15 @@ def test_store_idempotency():
 
 def test_runners_validate_and_skills():
     assert validate_repo_url("https://github.com/acme/app").endswith(".git")
+    assert validate_repo_url("https://github.com/acme/app") == "https://github.com/acme/app.git"
     assert validate_repo_url("acme/app") == "acme/app"
     try:
         validate_repo_url("not a url!!!")
+        raise AssertionError("should raise")
+    except ValueError:
+        pass
+    try:
+        validate_repo_url("https://evil.com/a/b")
         raise AssertionError("should raise")
     except ValueError:
         pass

@@ -36,6 +36,21 @@ class FactoryDefinition(BaseModel):
 REQUIRED_AGENTS = {"coordinator", "triage", "spec", "implement", "review"}
 
 
+def _normalize_automation(raw: dict) -> dict:
+    """Accept YAML `if/do` spelling and normalize to condition/action.
+
+    PyYAML parses unquoted `on:` as boolean True — map it back.
+    """
+    out = dict(raw)
+    if True in out and "on" not in out:
+        out["on"] = out.pop(True)
+    if "if" in out and "condition" not in out:
+        out["condition"] = out.pop("if")
+    if "do" in out and "action" not in out:
+        out["action"] = out.pop("do")
+    return out
+
+
 def load_factory(path: str | Path) -> FactoryDefinition:
     p = Path(path)
     if p.is_dir():
@@ -43,11 +58,12 @@ def load_factory(path: str | Path) -> FactoryDefinition:
     data = yaml.safe_load(p.read_text()) or {}
     agents = {k: AgentConfig(**v) for k, v in (data.get("agents") or {}).items()}
     runners = {k: RunnerConfig(**v) for k, v in (data.get("runners") or {}).items()}
+    automations = [_normalize_automation(a) for a in (data.get("automations") or [])]
     return FactoryDefinition(
         factory_name=data.get("factory", {}).get("name", "default"),
         repos=data.get("factory", {}).get("repos", []),
         agents=agents,
-        automations=data.get("automations", []),
+        automations=automations,
         runners=runners,
         scorers=data.get("scorers", []),
         webhooks=data.get("webhooks", []),
@@ -64,18 +80,34 @@ def check_factory(defn: FactoryDefinition) -> list[str]:
     rev = defn.agents.get("review")
     if impl and rev and impl.model.split("/")[0] == rev.model.split("/")[0]:
         errors.append("review model vendor must differ from implement model vendor")
-    if not defn.repos:
-        errors.append("factory.repos is empty")
+    if not defn.repos or any(not r or "/" not in r for r in defn.repos):
+        errors.append("factory.repos must be non-empty owner/repo entries")
     for name, runner in defn.runners.items():
         resources = runner.resources or {}
         if not resources.get("cpu") or not resources.get("memory"):
             errors.append(f"runner {name}: set cpu+memory limits")
-        if resources.get("timeoutMinutes", 30) > 120:
-            errors.append(f"runner {name}: timeoutMinutes must be <= 120")
-    if not defn.scorers:
+        timeout = resources.get("timeoutMinutes", 30)
+        if not isinstance(timeout, int) or timeout <= 0 or timeout > 120:
+            errors.append(f"runner {name}: timeoutMinutes must be int 1..120")
+        if runner.backend not in {"kubernetes", "docker"}:
+            errors.append(f"runner {name}: backend must be kubernetes|docker")
+        if not runner.image:
+            errors.append(f"runner {name}: image required")
+        if not runner.branch_prefix:
+            errors.append(f"runner {name}: branch_prefix required")
+    scorer_names = {s.get("name", "") for s in defn.scorers} if defn.scorers else set()
+    if "tests-pass" not in scorer_names:
         errors.append("no scorers defined (need at least tests-pass)")
     if not defn.automations:
         errors.append("no automations defined")
+    for a in defn.automations:
+        if not a.get("name") or not a.get("on"):
+            errors.append(f"automation missing name/on: {a}")
+    for agent_name, agent in defn.agents.items():
+        if not agent.instructions:
+            errors.append(f"agent {agent_name}: instructions required")
+        if not agent.harness:
+            errors.append(f"agent {agent_name}: harness required")
     return errors
 
 
