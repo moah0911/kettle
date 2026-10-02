@@ -1,6 +1,16 @@
-# Kettle — autonomous software development factory
+# Kettle — Autonomous Software Development Factory
 
-Self-hosted team of agents that turns requests into reviewed pull requests.
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Temporal](https://img.shields.io/badge/Temporal-durable_orchestration-39477F?style=flat)](https://temporal.io/)
+[![Postgres](https://img.shields.io/badge/PostgreSQL-4169E1?style=flat&logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-Jobs-326CE5?style=flat&logo=kubernetes&logoColor=white)](https://kubernetes.io/)
+[![LiteLLM](https://img.shields.io/badge/LLM-LiteLLM_OpenAI_compatible-6E56CF?style=flat)](https://github.com/BerriAI/litellm)
+[![License](https://img.shields.io/badge/License-see_REPO-green?style=flat)](./LICENSE)
+
+Self-hosted team of agents that turns requests into **reviewed pull requests — humans merge, agents never merge.**
+
+> Built by [Boyina Gowtham](https://github.com/moah0911) · AI Engineer × DevRel
 
 One coordinator conversation per work item. Four stage agents own part of the lifecycle:
 
@@ -57,3 +67,15 @@ uv run python -m kettle.factory_check --factory ./factory
 - Local: `python-backend`, `python-testing-patterns`, `pytest-coverage`, `system-design`
 
 See `docs/` for architecture, intake sources (GitHub/Slack/Linear/Jira/webhooks/API/MCP/cron), trust model, and scorer loop.
+
+## Why Kettle?
+
+Manual triage → spec → code → review doesn't scale. Kettle makes each stage explicit, durable (Temporal), and auditable — with independent cross-vendor review and a max of 2 revision cycles so work always converges to a human decision.
+
+## Contributing
+
+PRs welcome. Run `uv run pytest --cov=kettle tests/ -q` and `uv run python -m kettle.factory_check --factory ./factory` before opening a PR.
+
+## Author
+
+**Boyina Gowtham** — AI Engineer × DevRel · [GitHub](https://github.com/moah0911) · [LinkedIn](https://www.linkedin.com/in/boyinagowtham/) · [Medium](https://thegowtham.medium.com/)
