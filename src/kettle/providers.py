@@ -52,6 +52,7 @@ def chat(req: ChatRequest, *, timeout_s: int = 60, num_retries: int = 3) -> str:
 MODELS: dict[str, str] = {
     "coordinator": "anthropic/claude-sonnet-4-6",
     "triage": "anthropic/claude-haiku-4-5",
+    "story": "anthropic/claude-sonnet-4-6",
     "spec": "anthropic/claude-sonnet-4-6",
     "implement": "anthropic/claude-sonnet-4-6",
     "review": "openai/gpt-5-codex",

@@ -1,5 +1,5 @@
 from kettle.factory_check import check_factory, load_factory
-from kettle.runners import branch_name, build_docker_run, build_k8s_job
+from kettle.runners import branch_name, build_k8s_job, clone_repo
 from kettle.scorers import group_failures, score_criteria_met, score_tests_pass
 
 
@@ -30,12 +30,63 @@ def test_k8s_job_spec_shape():
     assert "factory/wi-abc" in str(spec["spec"]["template"]["spec"]["containers"][0]["env"])
 
 
-def test_branch_and_docker():
+def test_branch_slug():
     assert branch_name("factory/", "WI_AbC!") == "factory/wi-abc"
-    run = build_docker_run(
-        work_item_id="a", stage="building", agent="implement", model="m", repo="r"
-    )
-    assert run["backend"] == "docker"
+
+
+def test_clone_repo_rejects_unbrokered_hosts():
+    import pytest as _p
+
+    with _p.raises(ValueError, match="bad repo url"):
+        clone_repo(repo="https://evil.com/a/b", dest="/tmp/kettle-nope")
+
+
+def test_clone_repo_reports_missing_git(monkeypatch, tmp_path):
+    import pytest as _p
+
+    import kettle.runners as r
+
+    def no_git(*a, **kw):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(r.subprocess, "run", no_git)
+    with _p.raises(RuntimeError, match="git is not available"):
+        clone_repo(repo="acme/app", dest=str(tmp_path))
+
+
+def test_clone_repo_reports_clone_failure_and_redacts_token(monkeypatch, tmp_path):
+    import pytest as _p
+
+    import kettle.runners as r
+
+    class P:
+        returncode = 128
+        stderr = "remote: Invalid username or password https://sekret-token@github.com/acme/app.git"
+
+    monkeypatch.setattr(r.subprocess, "run", lambda *a, **kw: P())
+    with _p.raises(RuntimeError) as exc:
+        clone_repo(repo="acme/app", dest=str(tmp_path), token="sekret-token")
+    assert "sekret-token" not in str(exc.value)
+    assert "***" in str(exc.value)
+
+
+def test_clone_repo_builds_authenticated_url(monkeypatch, tmp_path):
+    import kettle.runners as r
+
+    seen: dict = {}
+
+    class P:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return P()
+
+    monkeypatch.setattr(r.subprocess, "run", fake_run)
+    out = clone_repo(repo="acme/app", dest=str(tmp_path), token="tok")
+    assert out == str(tmp_path)
+    assert seen["cmd"][4] == "https://tok@github.com/acme/app.git"
 
 
 def test_scorers():

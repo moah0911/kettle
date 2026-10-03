@@ -14,14 +14,27 @@ from .runners import validate_repo_url
 
 
 def submit_task(title: str, body: str, repo: str) -> WorkItem:
+    from .integrations import repo_allowed
+
     validate_repo_url(repo)
     if not title:
         raise ValueError("title required")
     if len(body) > 50000:
         raise ValueError("body too large")
+    if not repo_allowed(repo, _factory_repos()):
+        raise ValueError(f"repo not in factory: {repo}")
     return WorkItem(
         id=f"wi-{uuid.uuid4().hex[:8]}", source="mcp", title=title, body=body, repo=repo
     )
+
+
+def _factory_repos() -> list[str]:
+    from .factory_check import load_factory
+
+    try:
+        return load_factory(os.getenv("FACTORY_DIR", "./factory")).repos
+    except (OSError, ValueError):
+        return []
 
 
 def _api() -> tuple[str, dict]:
@@ -102,7 +115,8 @@ def _handle_call(name: str, arguments: dict) -> dict:
             client = await Client.connect(os.getenv("TEMPORAL_HOST", ""))
             handle = client.get_workflow_handle(arguments["workflow_id"])
             await handle.signal(
-                "answer_question", int(arguments["question_id"]), str(arguments["answer"])
+                "answer_question",
+                args=[int(arguments["question_id"]), str(arguments["answer"])],
             )
 
         asyncio.run(_signal())

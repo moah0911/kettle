@@ -14,13 +14,7 @@ from kettle.integrations import verify_github_signature
 from kettle.models import HandoffArtifact, TriageVerdict, WorkItem
 from kettle.providers import estimate_cost_usd, model_for, vendor_of
 from kettle.runners import skill_env, validate_repo_url
-from kettle.scorers import (
-    BenchmarkResult,
-    FrontierEntry,
-    compare_benchmarks,
-    propose_followup,
-    update_frontier,
-)
+from kettle.scorers import group_failures, score_criteria_met, score_tests_pass
 from kettle.store import WorkItemStore
 from kettle.trust import allowed_tool
 
@@ -68,6 +62,9 @@ def test_select_harness_differs():
     assert select_harness("review", "anthropic/claude-sonnet-4-6", "openai/gpt-5-codex") == "codex"
     assert select_harness("review", "openai/gpt-5-codex", "") == "claude-code"
     assert select_harness("implement") == "claude-code"
+    # Read-only stages never execute, so they get the harness that does nothing
+    assert select_harness("triage") == "read-only"
+    assert select_harness("spec") == "read-only"
 
 
 def test_trust_model():
@@ -109,10 +106,67 @@ def test_harness_registry(monkeypatch):
     assert get_harness("codex").name == "codex"
     with pytest.raises(ValueError):
         get_harness("nope")
-    res = get_harness("shell").run(
-        work_item_id="a", stage="building", repo="r", branch="b", prompt="echo hi"
+    # The read-only harness executes nothing: no subprocess, no workdir needed
+    res = get_harness("read-only").run(
+        work_item_id="a", stage="triage", repo="r", branch="b", prompt="echo hi"
     )
     assert res.branch == "b" and res.tests_exit_code == 0
+    assert res.evidence == "echo hi"
+
+
+def test_read_only_harness_ignores_subprocess(monkeypatch):
+    # Even a hostile prompt is returned as evidence, never executed
+    import kettle.harnesses as h
+
+    def exploding_run(*a, **kw):
+        raise AssertionError("read-only harness must not touch subprocess")
+
+    monkeypatch.setattr(h.subprocess, "run", exploding_run)
+    res = get_harness("read-only").run(
+        work_item_id="a",
+        stage="spec",
+        repo="r",
+        branch="b",
+        prompt="$(rm -rf /) && echo pwned",
+    )
+    assert res.tests_exit_code == 0
+    assert "pwned" in res.evidence
+
+
+def test_executing_harness_refuses_without_workdir():
+    # No default directory: any default would be the worker's own checkout
+    with pytest.raises(RuntimeError, match="refuses to run without a workdir"):
+        get_harness("codex").run(
+            work_item_id="a", stage="implement", repo="r", branch="b", prompt="do it"
+        )
+
+
+def test_executing_harness_runs_inside_workdir(tmp_path, monkeypatch):
+    import kettle.harnesses as h
+
+    seen: dict = {}
+
+    def fake_run(cmd, **kw):
+        seen["cwd"] = kw.get("cwd")
+
+        class P:
+            returncode = 0
+            stdout = "did the thing"
+            stderr = ""
+
+        return P()
+
+    monkeypatch.setattr(h.subprocess, "run", fake_run)
+    res = get_harness("codex").run(
+        work_item_id="a",
+        stage="implement",
+        repo="r",
+        branch="b",
+        prompt="do it",
+        workdir=str(tmp_path),
+    )
+    assert res.tests_exit_code == 0
+    assert seen["cwd"] == str(tmp_path)
 
 
 def test_store_idempotency():
@@ -140,21 +194,9 @@ def test_runners_validate_and_skills():
     assert skill_env(["a"], [{"name": "github"}])["SKILL_MCP_SERVERS"] == "github"
 
 
-def test_scorers_benchmark_frontier_followup():
-    best = compare_benchmarks(
-        [
-            BenchmarkResult(config="a", passed=8, total=10, cost_usd=2.0),
-            BenchmarkResult(config="b", passed=8, total=10, cost_usd=1.0),
-        ]
-    )
-    assert best.config == "b"
-    f = update_frontier([FrontierEntry(name="v1", score=0.8)], FrontierEntry(name="v2", score=0.9))
-    assert [e.name for e in f] == ["v2", "v1"]
-    assert propose_followup("none", "wi-1", "r") is None
-    assert propose_followup("test-failures", "wi-1", "acme/app")["labels"] == [
-        "factory",
-        "followup",
-    ]
+def test_scorers_group_failures():
+    assert group_failures([score_tests_pass(1), score_criteria_met(3, 3, 3)]) == "test-failures"
+    assert group_failures([score_tests_pass(0), score_criteria_met(3, 3, 3)]) == "none"
 
 
 def test_providers_models():

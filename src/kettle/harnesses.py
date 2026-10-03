@@ -1,4 +1,17 @@
-"""Harness adapters — same prompt, different executors. Always executes."""
+"""Harness adapters — same prompt, different executors.
+
+Two kinds exist, and the distinction is load-bearing:
+
+- Read-only harnesses never execute anything. They return the agent output as
+  evidence. Triage, spec, story, and review reasoning all end here.
+- Agent-CLI harnesses shell out to an installed CLI (`claude-code`, `codex`,
+  `opencode`) — but only inside an explicit `workdir`. An executing harness
+  called without one refuses to run. There is no default directory, because any
+  default would be the worker's own checkout.
+
+Nothing here ever passes model output to a bare shell. A prompt is data for an
+agent CLI, not a command line.
+"""
 
 from __future__ import annotations
 
@@ -15,12 +28,49 @@ class HarnessResult:
 
 
 class Harness:
-    name = "shell"
-    command: tuple[str, ...] = ("sh", "-c")
+    """Safe default: read-only. Returns the prompt as evidence, executes nothing.
+
+    New harness types inherit this behavior unless they explicitly opt into
+    execution by subclassing AgentCliHarness. Forgetting to set a flag must
+    never be what makes a harness execute.
+    """
+
+    name = "read-only"
+    executes = False
 
     def run(
-        self, *, work_item_id: str, stage: str, repo: str, branch: str, prompt: str
+        self,
+        *,
+        work_item_id: str,
+        stage: str,
+        repo: str,
+        branch: str,
+        prompt: str,
+        workdir: str | None = None,
     ) -> HarnessResult:
+        return HarnessResult(branch=branch, tests_exit_code=0, evidence=prompt[:2000])
+
+
+class AgentCliHarness(Harness):
+    """Base for harnesses that invoke an agent CLI. Execution requires a workdir."""
+
+    executes = True
+    command: tuple[str, ...] = ()
+
+    def run(
+        self,
+        *,
+        work_item_id: str,
+        stage: str,
+        repo: str,
+        branch: str,
+        prompt: str,
+        workdir: str | None = None,
+    ) -> HarnessResult:
+        if not workdir:
+            raise RuntimeError(f"harness {self.name} refuses to run without a workdir")
+        if not self.command:
+            raise RuntimeError(f"harness {self.name} defines no command")
         try:
             proc = subprocess.run(
                 list(self.command) + [prompt],
@@ -28,6 +78,7 @@ class Harness:
                 text=True,
                 timeout=600,
                 check=False,
+                cwd=workdir,
             )
             return HarnessResult(
                 branch=branch,
@@ -44,27 +95,23 @@ class Harness:
             )
 
 
-class ShellHarness(Harness):
-    name = "shell"
-
-
-class ClaudeCodeHarness(Harness):
+class ClaudeCodeHarness(AgentCliHarness):
     name = "claude-code"
     command = ("claude-code", "exec")
 
 
-class CodexHarness(Harness):
+class CodexHarness(AgentCliHarness):
     name = "codex"
     command = ("codex", "exec")
 
 
-class OpenCodeHarness(Harness):
+class OpenCodeHarness(AgentCliHarness):
     name = "opencode"
     command = ("opencode", "run")
 
 
 HARNESSES: dict[str, Harness] = {
-    "shell": ShellHarness(),
+    "read-only": Harness(),
     "claude-code": ClaudeCodeHarness(),
     "codex": CodexHarness(),
     "opencode": OpenCodeHarness(),

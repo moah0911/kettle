@@ -1,9 +1,11 @@
 """Coordinator routing tests (AAA pattern, no live services)."""
 
 from kettle.coordinator import (
+    handoff_allowed,
     initial_stage,
     needs_planning,
     route_after_review,
+    route_after_story,
     route_after_triage,
     should_skip_triage,
 )
@@ -39,8 +41,19 @@ def test_needs_planning_skips_trivial_labels():
 
 
 def test_route_after_triage_respects_complexity():
-    assert route_after_triage(_item(labels=["docs"])) == Stage.BUILDING
-    assert route_after_triage(_item(labels=["bug"], body="x" * 500), "m") == Stage.PLANNING
+    # Arrange
+    trivial = _item(labels=["docs"])
+    real = _item(labels=["bug"], body="x" * 500)
+    # Act + Assert: trivial work skips both story and planning
+    assert route_after_triage(trivial) == Stage.BUILDING
+    # Anything that needs planning gets a story first — the human gate
+    # sits in front of technical design, not behind it.
+    assert route_after_triage(real, "m") == Stage.STORY
+
+
+def test_route_after_story_gates_on_approval():
+    assert route_after_story(True) == Stage.PLANNING
+    assert route_after_story(False) == Stage.HANDOFF
 
 
 def test_route_after_review_caps_revisions():
@@ -50,8 +63,15 @@ def test_route_after_review_caps_revisions():
     assert route_after_review(ReviewVerdict.REJECT, 0) == Stage.HANDOFF
 
 
+def test_only_an_approved_review_opens_a_pull_request():
+    # A rejection must not produce a PR that looks like ordinary work
+    assert handoff_allowed(ReviewVerdict.APPROVE) is True
+    assert handoff_allowed(ReviewVerdict.REQUEST_CHANGES) is False
+    assert handoff_allowed(ReviewVerdict.REJECT) is False
+
+
 def test_initial_stage_short_circuits_when_rich():
     item = _item(
         labels=["bug"], body="Repro ... expected ... acceptance ... files to change ..." + "x" * 100
     )
-    assert initial_stage(item) in {Stage.PLANNING, Stage.BUILDING}
+    assert initial_stage(item) in {Stage.STORY, Stage.PLANNING, Stage.BUILDING}

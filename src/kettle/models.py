@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, model_validator
 class Stage(str, Enum):
     INTAKE = "intake"
     TRIAGE = "triage"
+    STORY = "story"
     PLANNING = "planning"
     BUILDING = "building"
     REVIEWING = "reviewing"
@@ -22,6 +23,7 @@ class Stage(str, Enum):
 class WorkItemStatus(str, Enum):
     INTAKE = "intake"
     TRIAGE = "triage"
+    STORY = "story"
     PLANNING = "planning"
     BUILDING = "building"
     REVIEWING = "reviewing"
@@ -78,11 +80,14 @@ class RunRecord(BaseModel):
     verdict: ReviewVerdict | None = None
 
 
+ArtifactKind = Literal["research", "story", "plan", "diff", "review"]
+
+
 class HandoffArtifact(BaseModel):
     """Long docs (research memos, plans) pass by ID, not inline — eve pattern."""
 
     id: str = Field(pattern=r"^[a-z0-9-]{1,64}$")
-    kind: Literal["research", "plan", "diff", "review"] = "research"
+    kind: ArtifactKind = "research"
     work_item_id: str
     body: str = ""
     size_bytes: int = Field(default=0, ge=0)
@@ -100,3 +105,52 @@ class TriageVerdict(BaseModel):
 class DefinitionOfReady(BaseModel):
     ready: bool
     missing: list[str] = Field(default_factory=list)
+
+
+class StoryVerdict(BaseModel):
+    """Story contract: business ambiguity resolved before any technical design.
+
+    Five sections, in order. `open_questions` is the escape hatch — an agent that
+    cannot resolve a rule must ask here rather than invent an answer downstream.
+    """
+
+    story: str = Field(min_length=1)
+    acceptance_criteria: list[str] = Field(min_length=1)
+    edge_cases: list[str] = Field(default_factory=list)
+    out_of_scope: list[str] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)
+
+    def unresolved(self) -> bool:
+        return bool(self.open_questions)
+
+
+class ReviewFinding(BaseModel):
+    """One review finding. `ref` must be `path:line` — evidence is not optional.
+
+    Brackets are allowed so framework dynamic routes (`[id]`) stay citable; the
+    factory reviews other people's repos, not only Python ones.
+    """
+
+    severity: Literal["critical", "important", "minor"]
+    ref: str = Field(pattern=r"^[\w./\[\]-]+:\d+")
+    detail: str = Field(min_length=1)
+    opinion: bool = False
+
+    def blocks_merge(self) -> bool:
+        return self.severity in {"critical", "important"} and not self.opinion
+
+
+class ReviewReport(BaseModel):
+    """Structured review output. Replaces substring verdict scanning."""
+
+    verdict: ReviewVerdict
+    findings: list[ReviewFinding] = Field(default_factory=list)
+    unparsed: bool = False
+
+    def blocking(self) -> list[ReviewFinding]:
+        return [f for f in self.findings if f.blocks_merge()]
+
+    @classmethod
+    def fail_closed(cls) -> ReviewReport:
+        """Unparseable or unevidenced review output never reads as approval."""
+        return cls(verdict=ReviewVerdict.REQUEST_CHANGES, findings=[], unparsed=True)

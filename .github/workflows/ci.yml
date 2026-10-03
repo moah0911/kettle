@@ -14,6 +14,6 @@ jobs:
       - run: uv sync --frozen --extra dev
       - run: uv run ruff check src tests
       - run: uv run ruff format --check src tests
-      - run: uv run mypy src/kettle/models.py src/kettle/coordinator.py src/kettle/scorers.py
-      - run: uv run pytest --cov=kettle --cov-fail-under=60 tests/ -q
+      - run: uv run mypy src
+      - run: uv run pytest --cov=kettle --cov-fail-under=75 tests/ -q
       - run: uv run python -m kettle.factory_check --factory ./factory

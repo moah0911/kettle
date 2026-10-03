@@ -8,11 +8,21 @@ from temporalio import workflow
 
 with workflow.unsafe.imports_passed_through():
     from . import activities
+    from .coordinator import handoff_allowed, route_after_story
     from .models import ReviewVerdict, Stage
 
 # Versioned default: pass max_revisions as workflow arg to avoid replay breaks
 # when the constant changes. Kept in sync with coordinator.MAX_REVISION_CYCLES.
 DEFAULT_MAX_REVISIONS = 2
+
+# Bumped whenever the *sequence* of activities or wait_conditions changes.
+# Temporal replays in-flight workflows against new code; a reordered stage list
+# is a non-determinism error, not a bug. Add a workflow.version() patch around
+# the change when this moves.
+#
+# v3: open_handoff became conditional. A rejected or capped run no longer opens a
+#     draft PR, which changes the recorded activity sequence on that path.
+STAGE_SEQUENCE_VERSION = 3
 
 
 @workflow.defn
@@ -22,9 +32,18 @@ class CoordinatorWorkflow:
     def __init__(self) -> None:
         self._approved = False
         self._approved_seen_spec = False
+        self._story_approved = False
+        self._story_seen = False
         self._cancelled = False
         self._answer: str | None = None
         self._question_id = 0
+
+    @workflow.signal
+    async def approve_story(self, story_version: int = 1) -> None:
+        # Mirrors approve_spec: approvals arriving before the story stage ran
+        # are ignored rather than silently satisfying a future gate.
+        if self._story_seen:
+            self._story_approved = True
 
     @workflow.signal
     async def approve_spec(self, spec_version: int = 1) -> None:
@@ -96,6 +115,22 @@ class CoordinatorWorkflow:
                 args=[title, body, labels, triage.get("complexity", "m")],
                 start_to_close_timeout=timedelta(minutes=1),
             )
+        if stage == Stage.STORY.value:
+            await workflow.execute_activity(
+                activities.run_story,
+                args=[work_item_id, title, body, repo],
+                start_to_close_timeout=timedelta(minutes=10),
+            )
+            # Business-intent gate. A human decides whether this is the right
+            # problem before any technical design happens.
+            self._story_seen = True
+            await workflow.wait_condition(lambda: self._story_approved or self._cancelled)
+            if self._cancelled:
+                return Stage.CANCELLED.value
+            # A refused story parks for a human; there is no code to hand off.
+            stage = route_after_story(self._story_approved).value
+            if stage == Stage.HANDOFF.value:
+                return stage
         if stage == Stage.PLANNING.value:
             await workflow.execute_activity(
                 activities.run_stage,
@@ -109,30 +144,35 @@ class CoordinatorWorkflow:
                 return Stage.CANCELLED.value
             stage = Stage.BUILDING.value
         revisions = 0
-        parked_on_human = False
+        # A string, matching the activity's return type. Initialize to a verdict
+        # that blocks the handoff so a loop that never runs cannot reach the PR.
+        final_verdict: str = ReviewVerdict.REQUEST_CHANGES.value
         while True:
             await workflow.execute_activity(
                 activities.run_stage,
                 args=[work_item_id, "implement", repo],
                 start_to_close_timeout=timedelta(minutes=60),
             )
-            verdict = await workflow.execute_activity(
+            final_verdict = await workflow.execute_activity(
                 activities.run_review,
                 args=[work_item_id, repo],
                 start_to_close_timeout=timedelta(minutes=30),
             )
-            if verdict == ReviewVerdict.APPROVE.value:
+            if final_verdict == ReviewVerdict.APPROVE.value:
                 break
-            if verdict == ReviewVerdict.REJECT.value or revisions >= max_revisions:
-                parked_on_human = True
+            if final_verdict == ReviewVerdict.REJECT.value or revisions >= max_revisions:
                 break
             revisions += 1
+        if not handoff_allowed(ReviewVerdict(final_verdict)):
+            # Rejected, or out of revision cycles. The branch exists and is pushed,
+            # but no pull request is opened — see coordinator.handoff_allowed.
+            return Stage.HANDOFF.value
         await workflow.execute_activity(
             activities.open_handoff,
             args=[work_item_id, repo],
             start_to_close_timeout=timedelta(minutes=5),
         )
-        return Stage.HANDOFF.value if parked_on_human else Stage.COMPLETE.value
+        return Stage.COMPLETE.value
 
 
 @workflow.defn

@@ -11,8 +11,15 @@ from pydantic import BaseModel, Field
 
 class AgentConfig(BaseModel):
     model: str
-    harness: str = "shell"
+    harness: str = "read-only"
     instructions: str = ""
+    must_not: list[str] = Field(default_factory=list)
+    output_format: str = ""
+    skills: list[str] = Field(default_factory=list)
+
+    def is_complete(self) -> bool:
+        """An agent is only usable when purpose, boundaries, and contract exist."""
+        return bool(self.instructions.strip() and self.must_not and self.output_format.strip())
 
 
 class RunnerConfig(BaseModel):
@@ -33,7 +40,25 @@ class FactoryDefinition(BaseModel):
     skills: list[str] = Field(default_factory=list)
 
 
-REQUIRED_AGENTS = {"coordinator", "triage", "spec", "implement", "review"}
+REQUIRED_AGENTS = {"coordinator", "triage", "story", "spec", "implement", "review"}
+
+# Stages that write to the target repository. Their boundaries are load-bearing:
+# a scope leak here lands in a pull request a human has to unpick.
+WRITE_STAGES = {"story", "spec", "implement"}
+
+
+def _forbids_merge(agent: AgentConfig) -> bool:
+    """The no-merge invariant must be stated by the agent, not implied by policy."""
+    return any("merge" in rule.lower() for rule in agent.must_not)
+
+
+def _known_harnesses() -> set[str]:
+    """Harness names the runtime can actually resolve. Imported lazily: the
+    registry lives in harnesses, the schema lives here, and neither may import
+    the other at module load."""
+    from .harnesses import HARNESSES
+
+    return set(HARNESSES)
 
 
 def _normalize_automation(raw: dict) -> dict:
@@ -108,6 +133,16 @@ def check_factory(defn: FactoryDefinition) -> list[str]:
             errors.append(f"agent {agent_name}: instructions required")
         if not agent.harness:
             errors.append(f"agent {agent_name}: harness required")
+        elif agent.harness not in _known_harnesses():
+            errors.append(f"agent {agent_name}: unknown harness {agent.harness!r}")
+        if not agent.must_not:
+            errors.append(f"agent {agent_name}: must_not boundaries required")
+        if not agent.output_format:
+            errors.append(f"agent {agent_name}: output_format contract required")
+        if not agent.skills and not defn.skills:
+            errors.append(f"agent {agent_name}: no skills (agent-level or factory-level)")
+        if agent_name in WRITE_STAGES and not _forbids_merge(agent):
+            errors.append(f"agent {agent_name}: must_not must explicitly forbid merging")
     return errors
 
 

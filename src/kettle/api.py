@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
+from .artifacts import list_for_work_item
 from .automations import Automation, match_automation
 from .factory_check import FactoryDefinition, load_factory
 from .integrations import (
@@ -22,30 +23,41 @@ from .integrations import (
     verify_github_signature,
     verify_slack_signature,
 )
-from .models import RunRecord, Stage, WorkItem, WorkItemStatus
+from .models import HandoffArtifact, RunRecord, Stage, WorkItem, WorkItemStatus
 from .store import Base as StoreBase
 from .store import RunRow, ScheduleRow, ScoreRow, WorkItemRow, WorkItemStore, get_engine, session
-from .trust import allowed_tool
 
 app = FastAPI(title="kettle", version="0.1.0")
 
 StoreBase.metadata.create_all(get_engine())
 
 _STORE = WorkItemStore()
-_AUTOMATIONS: list[Automation] = [
-    Automation(
-        name="bug-issues",
-        on="github.issue_labeled",
-        condition="label == 'factory'",
-        action="coordinator",
-    ),
-    Automation(
-        name="ci-fix",
-        on="github.check_suite.failed",
-        condition="branch startswith 'factory/'",
-        action="coordinator",
-    ),
-]
+
+
+def _factory_automations() -> list[Automation]:
+    """Automations live in factory/kettle.yaml — the same file `kettle check`
+    validates. A hardcoded copy here would drift from the validated config, so
+    there isn't one: malformed entries are skipped, never matched."""
+    from pydantic import ValidationError
+
+    try:
+        defn = load_factory(os.getenv("FACTORY_DIR", "./factory"))
+    except (OSError, ValueError):
+        return []
+    out: list[Automation] = []
+    for raw in defn.automations:
+        try:
+            out.append(
+                Automation(
+                    name=raw.get("name", ""),
+                    on=raw.get("on", ""),
+                    condition=raw.get("condition", ""),
+                    action=raw.get("action", "coordinator"),
+                )
+            )
+        except (ValidationError, AttributeError):
+            continue
+    return [a for a in out if a.name and a.on]
 
 
 class CreateWorkItem(BaseModel):
@@ -59,10 +71,11 @@ class CreateWorkItem(BaseModel):
 
 class Approval(BaseModel):
     work_item_id: str = Field(min_length=1)
-    kind: Literal["spec", "question", "merge"] = "spec"
+    kind: Literal["story", "spec", "question", "merge"] = "spec"
     approved: bool = True
     note: str = Field(default="", max_length=5000)
     actor: str = Field(default="", max_length=200)
+    question_id: int = Field(default=0, ge=0)
 
 
 def _require_api_key(x_api_key: str | None = Header(default=None)) -> None:
@@ -141,31 +154,92 @@ def get_work_item(item_id: str, _auth: None = Depends(_require_api_key)) -> Work
     return item
 
 
+@app.get("/v1/work-items/{item_id}/artifacts", response_model=list[HandoffArtifact])
+def list_work_item_artifacts(
+    item_id: str, _auth: None = Depends(_require_api_key)
+) -> list[HandoffArtifact]:
+    """Long docs travel by ID. This is the only way to read them back."""
+    if not _STORE.get(item_id):
+        raise HTTPException(404, "work item not found")
+    return list_for_work_item(item_id)
+
+
 @app.post("/v1/approvals")
-def record_approval(payload: Approval, _auth: None = Depends(_require_api_key)) -> dict:
+async def record_approval(payload: Approval, _auth: None = Depends(_require_api_key)) -> dict:
+    """Record a human decision AND deliver it to the running workflow.
+
+    The DB transition is the record; the Temporal signal is the delivery. The
+    response reports both halves honestly: a recorded approval the workflow
+    never heard (`signaled: false`) is a stuck work item, not an approved one.
+    """
     item = _STORE.get(payload.work_item_id)
     if not item:
         raise HTTPException(404, "work item not found")
     transitioned = False
+    signal: str | None = None
+    signal_args: list = []
     if payload.kind == "merge":
         return {
             "ok": True,
             "kind": payload.kind,
             "approved": False,
             "transitioned": False,
+            "signaled": False,
             "reason": "agents never merge",
         }
+    if payload.kind == "story" and item.current_stage == Stage.STORY:
+        if not payload.approved:
+            return {
+                "ok": True,
+                "kind": payload.kind,
+                "approved": False,
+                "transitioned": False,
+                "signaled": False,
+                "reason": "story refused; workflow parks at handoff",
+            }
+        item.current_stage = Stage.PLANNING
+        item.status = WorkItemStatus.PLANNING
+        _STORE.update(item)
+        transitioned = True
+        signal = "approve_story"
     if payload.kind == "spec" and payload.approved and item.current_stage == Stage.PLANNING:
         item.current_stage = Stage.BUILDING
         item.status = WorkItemStatus.BUILDING
         _STORE.update(item)
         transitioned = True
+        signal = "approve_spec"
+    if payload.kind == "question" and payload.note:
+        # The note IS the answer. The workflow ignores mismatched or empty
+        # answers by design, so a stale question_id is a safe no-op.
+        signal, signal_args = "answer_question", [payload.question_id, payload.note]
+    signaled = await _send_workflow_signal(item.id, signal, signal_args) if signal else False
     return {
         "ok": True,
         "kind": payload.kind,
         "approved": payload.approved,
         "transitioned": transitioned,
+        "signaled": signaled,
     }
+
+
+async def _send_workflow_signal(item_id: str, signal: str, args: list) -> bool:
+    """Deliver a signal to `kettle-{item_id}`. Never raises: signal delivery
+    must not mask an already-recorded approval."""
+    host = os.getenv("TEMPORAL_HOST", "")
+    if not host:
+        return False
+    try:
+        from temporalio.client import Client
+
+        client = await Client.connect(host)
+        handle = client.get_workflow_handle(f"kettle-{item_id}")
+        if args:
+            await handle.signal(signal, args=args)
+        else:
+            await handle.signal(signal)
+        return True
+    except Exception:  # noqa: BLE001 — reported as signaled:false, see caller
+        return False
 
 
 @app.post("/webhooks/github")
@@ -175,8 +249,14 @@ async def github_webhook(request: Request) -> dict:
     if not verify_github_signature(raw, request.headers.get("X-Hub-Signature-256", "")):
         raise HTTPException(401, "bad webhook signature")
     event = await request.json()
+    if "type" not in event and any(k in event for k in ("action", "issue", "repository", "hook")):
+        # A genuine GitHub delivery. It verifies, then matches nothing, which
+        # used to return ok:true while dropping the event. Say so loudly.
+        raise HTTPException(
+            422, "raw GitHub events are not accepted; relay as {type, context} (docs/webhooks.md)"
+        )
     etype = event.get("type", "github.issue_labeled")
-    auto = match_automation(etype, event.get("context", {}), _AUTOMATIONS)
+    auto = match_automation(etype, event.get("context", {}), _factory_automations())
     if not auto:
         return {"ok": True, "routed": False}
     ctx = event.get("context", {})
@@ -194,7 +274,14 @@ async def github_webhook(request: Request) -> dict:
     if not item:
         return {"ok": True, "routed": False, "reason": "untrusted or missing factory label"}
     stored = _STORE.put(item, idempotency_key=f"github:{item.source_id}")
-    return {"ok": True, "routed": True, "work_item_id": stored.id, "via": auto.name}
+    dispatched = await _maybe_dispatch(stored)
+    return {
+        "ok": True,
+        "routed": True,
+        "work_item_id": stored.id,
+        "via": auto.name,
+        "dispatched": dispatched,
+    }
 
 
 @app.post("/webhooks/slack")
@@ -208,6 +295,14 @@ async def slack_webhook(request: Request) -> dict:
     ):
         raise HTTPException(401, "bad webhook signature")
     event = await request.json()
+    if event.get("type") == "url_verification" and "challenge" in event:
+        # Slack's subscription handshake. Signed like any other delivery, so
+        # verification above already ran; echoing enables the subscription.
+        return {"challenge": event["challenge"]}
+    if isinstance(event.get("event"), dict):
+        raise HTTPException(
+            422, "raw Slack events are not accepted; relay as the flat envelope (docs/webhooks.md)"
+        )
     if not repo_allowed(event.get("repo", ""), _factory_repos()):
         raise HTTPException(422, "repo not in factory")
     item = from_slack(
@@ -219,7 +314,7 @@ async def slack_webhook(request: Request) -> dict:
     )
     key = event.get("event_id", "")
     stored = _STORE.put(item, idempotency_key=f"slack:{key}" if key else "")
-    return {"ok": True, "work_item_id": stored.id}
+    return {"ok": True, "work_item_id": stored.id, "dispatched": await _maybe_dispatch(stored)}
 
 
 @app.post("/webhooks/linear")
@@ -231,6 +326,10 @@ async def linear_webhook(request: Request) -> dict:
     ):
         raise HTTPException(401, "bad webhook signature")
     event = await request.json()
+    if "data" in event and "issue_id" not in event:
+        raise HTTPException(
+            422, "raw Linear events are not accepted; relay as the flat envelope (docs/webhooks.md)"
+        )
     if not repo_allowed(event.get("repo", ""), _factory_repos()):
         raise HTTPException(422, "repo not in factory")
     item = from_linear(
@@ -241,7 +340,7 @@ async def linear_webhook(request: Request) -> dict:
         item_id=f"wi-{uuid.uuid4().hex[:8]}",
     )
     stored = _STORE.put(item, idempotency_key=f"linear:{item.source_id}")
-    return {"ok": True, "work_item_id": stored.id}
+    return {"ok": True, "work_item_id": stored.id, "dispatched": await _maybe_dispatch(stored)}
 
 
 @app.post("/webhooks/jira")
@@ -253,6 +352,10 @@ async def jira_webhook(request: Request) -> dict:
     ):
         raise HTTPException(401, "bad webhook signature")
     event = await request.json()
+    if "webhookEvent" in event:
+        raise HTTPException(
+            422, "raw Jira events are not accepted; relay as the flat envelope (docs/webhooks.md)"
+        )
     if not repo_allowed(event.get("repo", ""), _factory_repos()):
         raise HTTPException(422, "repo not in factory")
     item = from_jira(
@@ -263,22 +366,30 @@ async def jira_webhook(request: Request) -> dict:
         item_id=f"wi-{uuid.uuid4().hex[:8]}",
     )
     stored = _STORE.put(item, idempotency_key=f"jira:{item.source_id}")
-    return {"ok": True, "work_item_id": stored.id}
+    return {"ok": True, "work_item_id": stored.id, "dispatched": await _maybe_dispatch(stored)}
 
 
 @app.post("/webhooks/custom")
-def custom_webhook(event: dict, _auth: None = Depends(_require_api_key)) -> dict:
+async def custom_webhook(
+    event: dict, request: Request, _auth: None = Depends(_require_api_key)
+) -> dict:
     if not repo_allowed(event.get("repo", ""), _factory_repos()):
         raise HTTPException(422, "repo not in factory")
-    return create_work_item(
+    created = create_work_item(
         CreateWorkItem(
             source="webhook",
             title=event.get("title", "webhook task"),
             body=event.get("body", ""),
             repo=event.get("repo", ""),
             labels=event.get("labels", []),
-        )
-    ).model_dump()
+        ),
+        request,
+        _auth,
+    )
+    item = _STORE.get(created.id)
+    body = created.model_dump()
+    body["dispatched"] = await _maybe_dispatch(item) if item else False
+    return body
 
 
 @app.get("/v1/factory")
@@ -393,16 +504,17 @@ def list_runs(
 
 @app.get("/v1/runs/{run_id}/logs")
 def run_logs(run_id: str, _auth: None = Depends(_require_api_key)) -> dict:
-    from .runners import stream_job_logs
+    from .runners import job_name_for, stream_job_logs
 
     with session() as s:
         run = s.get(RunRow, run_id)
         if run is None:
             raise HTTPException(404, "run not found")
         branch, evidence = run.branch, run.evidence_url
+        job_name = job_name_for(run.work_item_id, run.stage)
     namespace = os.getenv("K8S_NAMESPACE", "kettle")
     try:
-        logs = stream_job_logs(namespace=namespace, job_name=f"kettle-{run_id}")
+        logs = stream_job_logs(namespace=namespace, job_name=job_name)
     except Exception as exc:  # noqa: BLE001 — fall back to stored pointer
         return {
             "run_id": run_id,
@@ -438,6 +550,8 @@ def record_score(score: ScoreIn, _auth: None = Depends(_require_api_key)) -> dic
 
 @app.get("/v1/dashboard")
 def dashboard(_auth: None = Depends(_require_api_key)) -> dict:
+    from .scorers import Score, group_failures
+
     with session() as s:
         by_stage: dict[str, int] = {}
         for stage_val, count in s.execute(
@@ -449,41 +563,70 @@ def dashboard(_auth: None = Depends(_require_api_key)) -> dict:
             s.execute(select(func.coalesce(func.sum(RunRow.cost_usd), 0.0))).scalar() or 0.0
         )
         schedules = s.execute(select(func.count()).select_from(ScheduleRow)).scalar() or 0
+        recent = s.execute(select(ScoreRow).order_by(ScoreRow.id.desc()).limit(200)).scalars()
+        scores = [Score(scorer=r.scorer, passed=r.passed, reason=r.reason) for r in recent]
+    failing = [sc for sc in scores if not sc.passed]
     return {
         "work_items_by_stage": by_stage,
         "runs": runs,
         "total_cost_usd": round(float(total_cost), 4),
         "schedules": schedules,
+        "failure_summary": {
+            "scored": len(scores),
+            "failing": len(failing),
+            "group": group_failures(scores) if scores else "none",
+        },
     }
 
 
 @app.post("/v1/work-items/{item_id}/dispatch")
 async def dispatch_work_item(item_id: str, _auth: None = Depends(_require_api_key)) -> dict:
     """Start the Temporal CoordinatorWorkflow. Always dials the server."""
-    import os as _os
+    item = _STORE.get(item_id)
+    if not item:
+        raise HTTPException(404, "work item not found")
+    if not repo_allowed(item.repo, _factory_repos()):
+        raise HTTPException(422, "repo not in factory")
+    host = os.getenv("TEMPORAL_HOST", "")
+    if not host:
+        raise HTTPException(503, "TEMPORAL_HOST is not configured")
+    workflow_id = await _start_workflow(item)
+    return {"ok": True, "workflow_id": workflow_id, "started": True}
 
+
+async def _start_workflow(item: WorkItem) -> str:
+    """Start the coordinator workflow for an item. Raises on failure."""
     from temporalio.client import Client
 
     from .workflows import CoordinatorWorkflow
 
-    item = _STORE.get(item_id)
-    if not item:
-        raise HTTPException(404, "work item not found")
-    if not allowed_tool("open_draft_pr", trusted=item.trusted, unattended=not item.trusted):
-        raise HTTPException(403, "delivery not allowed for this work item")
-    host = _os.getenv("TEMPORAL_HOST", "")
-    if not host:
-        raise HTTPException(503, "TEMPORAL_HOST is not configured")
-    client = await Client.connect(host)
+    client = await Client.connect(os.getenv("TEMPORAL_HOST", ""))
     workflow_id = f"kettle-{item.id}"
     await client.start_workflow(
         CoordinatorWorkflow.run,
-        item.id,
-        item.title,
-        item.body,
-        item.repo,
-        item.labels,
+        args=[item.id, item.title, item.body, item.repo, item.labels],
         id=workflow_id,
-        task_queue=_os.getenv("TEMPORAL_TASK_QUEUE", "kettle"),
+        task_queue=os.getenv("TEMPORAL_TASK_QUEUE", "kettle"),
     )
-    return {"ok": True, "workflow_id": workflow_id, "started": True}
+    return workflow_id
+
+
+async def _maybe_dispatch(item: WorkItem | None) -> bool:
+    """Dispatch an intake item when the server is configured, skip otherwise.
+
+    Webhook intake is an event, not a record: something happened, so the
+    coordinator should hear about it. Without TEMPORAL_HOST there is no
+    workflow to hear, and the item waits for a manual dispatch instead.
+    Never raises — a dispatch failure must not mask an accepted intake.
+    """
+    if item is None:
+        return False
+    if not repo_allowed(item.repo, _factory_repos()):
+        return False
+    if not os.getenv("TEMPORAL_HOST", ""):
+        return False
+    try:
+        await _start_workflow(item)
+        return True
+    except Exception:  # noqa: BLE001 — intake stays accepted, dispatch stays manual
+        return False

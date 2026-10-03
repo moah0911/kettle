@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 
 SAFE = re.compile(r"[^a-zA-Z0-9-]+")
 _GH = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(\.git)?$")
@@ -14,6 +15,16 @@ def slugify(value: str) -> str:
 
 def branch_name(prefix: str, work_item_id: str) -> str:
     return f"{prefix}{slugify(work_item_id)}"
+
+
+def job_name_for(work_item_id: str, stage: str) -> str:
+    """The single derivation of a stage Job's name.
+
+    The builder and the log reader must agree byte-for-byte; a second inline
+    format string is how the logs route learned to look for jobs that never
+    existed.
+    """
+    return f"kettle-{slugify(work_item_id)}-{slugify(stage)}"[:63].rstrip("-")
 
 
 def validate_repo_url(url: str) -> str:
@@ -34,6 +45,37 @@ def validate_repo_url(url: str) -> str:
     if url.endswith(".git"):
         return url
     return url + ".git"
+
+
+def clone_repo(*, repo: str, dest: str, token: str = "") -> str:
+    """Clone a brokered repo's default branch into dest. Returns dest.
+
+    Same broker rule as validate_repo_url: github.com only, nothing else. The
+    branch is created later by the agent; cloning pins nothing but the default.
+    A token is redacted from errors before they can reach evidence, artifacts,
+    or a PR body.
+    """
+    url = validate_repo_url(repo)
+    if "://" not in url:
+        url = f"https://github.com/{url.removesuffix('.git')}.git"
+    if token and url.startswith("https://"):
+        url = url.replace("https://", f"https://{token}@", 1)
+    try:
+        proc = subprocess.run(
+            ["git", "clone", "--depth", "1", url, dest],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"git is not available, cannot clone {repo}: {exc}") from exc
+    if proc.returncode != 0:
+        detail = proc.stderr[:500]
+        if token:
+            detail = detail.replace(token, "***")
+        raise RuntimeError(f"git clone failed for {repo}: {detail}")
+    return dest
 
 
 def skill_env(skills: list[str], mcp_servers: list[dict] | None = None) -> dict:
@@ -127,7 +169,7 @@ def build_k8s_job(
     if timeout_minutes <= 0 or timeout_minutes > 120:
         raise ValueError("timeout_minutes must be 1..120")
     branch = branch_name(branch_prefix, work_item_id)
-    job_name = f"kettle-{slugify(work_item_id)}-{slugify(stage)}"[:63].rstrip("-")
+    job_name = job_name_for(work_item_id, stage)
     extra = skill_env(skills or [], mcp_servers)
     return {
         "apiVersion": "batch/v1",
@@ -166,34 +208,5 @@ def build_k8s_job(
                     ],
                 },
             },
-        },
-    }
-
-
-def build_docker_run(
-    *,
-    work_item_id: str,
-    stage: str,
-    agent: str,
-    model: str,
-    repo: str,
-    branch_prefix: str = "factory/",
-    cpu: str = "2",
-    memory: str = "4Gi",
-    timeout_minutes: int = 30,
-) -> dict:
-    if timeout_minutes <= 0 or timeout_minutes > 120:
-        raise ValueError("timeout_minutes must be 1..120")
-    return {
-        "backend": "docker",
-        "image": "ghcr.io/kettle/agent-runner:latest",
-        "resources": {"cpu": cpu, "memory": memory, "timeoutMinutes": timeout_minutes},
-        "env": {
-            "WORK_ITEM_ID": work_item_id,
-            "STAGE": stage,
-            "AGENT": agent,
-            "MODEL": model,
-            "REPO": repo,
-            "BRANCH": branch_name(branch_prefix, work_item_id),
         },
     }
